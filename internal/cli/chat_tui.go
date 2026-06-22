@@ -1,3 +1,16 @@
+// chat_tui.go 实现了 Reasonix 的交互式聊天 TUI（终端用户界面）。
+// 基于 Bubble Tea (charm.land/bubbletea) 框架构建，提供：
+//   - 流式 Markdown 渲染的智能体对话
+//   - 工具调用的实时状态展示（Spinner、进度指示器）
+//   - 斜杠命令系统（/model、/skill、/memory、/effort 等）
+//   - 会话恢复（--continue / --resume）
+//   - 模型切换（/model）
+//   - 计划模式（Shift+Tab 切换）
+//   - YOLO 模式（Ctrl+Y 跳过工具审批）
+//   - 思维链展示（Ctrl+O 切换）
+//   - 系统通知集成
+//   - 剪贴板操作
+//   - 多主题支持
 package cli
 
 import (
@@ -40,10 +53,16 @@ import (
 	"reasonix/internal/tool"
 )
 
-// chatTUI is a bubbletea Model that normally owns the terminal with an
-// alt-screen transcript viewport. Termux is the exception: enabling mouse mode
-// prevents taps from raising the soft keyboard, so it stays in the normal buffer
-// and commits finalized output to native scrollback via tea.Println.
+// chatTUI 是 Bubble Tea 模型，通常以 alt-screen 转录视口拥有终端。
+// Termux 是例外：启用鼠标模式会阻止点击唤起软键盘，
+// 因此它保留在正常缓冲区中，通过 tea.Println 将最终输出提交到原生滚动缓冲区。
+//
+// 主要职责：
+//   - 管理用户输入（textarea）和智能体输出的渲染
+//   - 处理键盘事件（斜杠命令、快捷键、导航）
+//   - 流式显示智能体的推理、文本和工具调用
+//   - 管理会话状态（运行中、空闲、错误）
+//   - 支持模型切换、计划模式、YOLO 模式等
 type chatTUI struct {
 	ctrl    control.SessionAPI
 	label   string
@@ -448,8 +467,16 @@ type clipboardPasteMsg struct {
 
 // newChatTUI assembles the initial model. The controller has already been wired
 // with an event sink that feeds eventCh; the TUI issues commands to it and
-// renders the events it emits. Label, history, host, and commands are read from
-// the controller, so a resumed session pre-populates scrollback.
+// newChatTUI 创建新的聊天 TUI 模型实例。
+// 控制器的标签、历史记录、主机和命令被读取，因此恢复的会话会预填充滚动缓冲区。
+//
+// 参数：
+//   - ctrl: 会话 API 控制器
+//   - missing: 缺失密钥警告文本（就绪时为空）
+//   - eventCh: 事件通道（控制器的类型化事件流转为 tea.Msg）
+//   - termW: 初始终端宽度
+//
+// 返回值：初始化好的 chatTUI 模型
 func newChatTUI(ctrl control.SessionAPI, missing string, eventCh chan event.Event, termW int) chatTUI {
 	ti := textarea.New()
 	configureChatTextarea(&ti)
@@ -657,16 +684,28 @@ func (m *chatTUI) prompts() []plugin.Prompt {
 	return m.host.Prompts()
 }
 
+// Init 是 Bubble Tea 的初始化函数，返回启动时需要执行的命令。
+// 启动文本区域闪烁和事件监听。
 func (m chatTUI) Init() tea.Cmd {
 	return tea.Batch(
-		textarea.Blink,
-		waitForAgentEvent(m.eventCh),
+		textarea.Blink,                    // 启动光标闪烁
+		waitForAgentEvent(m.eventCh),      // 开始监听智能体事件
 		fetchBalance(m.ctrl),
 		m.runStatusline(), // nil (no-op) unless a custom status line is configured
 		m.refreshGitStatus(),
 	)
 }
 
+// Update 是 Bubble Tea 的消息处理函数。
+// 接收消息（键盘事件、窗口大小变化、智能体事件等），
+// 更新模型状态并返回新的模型和需要执行的命令。
+//
+// 参数：
+//   - msg: 消息（tea.Msg 接口）
+//
+// 返回值：
+//   - tea.Model: 更新后的模型
+//   - tea.Cmd: 需要执行的命令
 func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	wasAtBottom := m.viewport.AtBottom()
 	prevLines := len(m.transcript)
@@ -2211,6 +2250,8 @@ func (m chatTUI) runningWorkingLine(cancelRequested, styled bool) string {
 	return working
 }
 
+// View 是 Bubble Tea 的视图渲染函数，将当前 TUI 状态渲染为终端可显示的视图。
+// 它组合了转录视口、状态行、输入框和各种覆盖面板（审批、选择器等）。
 func (m chatTUI) View() tea.View {
 	boxW := m.width
 	if boxW < 10 {

@@ -29,6 +29,7 @@ var errBashTimeout = errors.New("bash foreground timeout")
 
 func init() { tool.RegisterBuiltin(bash{}) }
 
+// bashShellPATH 是获取登录 shell PATH 的函数，默认使用带缓存的实现。
 var bashShellPATH = cachedBashShellPATH
 
 // cachedBashShellPATH memoizes the login-shell PATH probe per login shell so a
@@ -57,19 +58,25 @@ func cachedBashShellPATH(ctx context.Context) string {
 	return v
 }
 
-// bash runs a shell command. sb, when it enforces, wraps the command in an OS
-// sandbox; the zero value registered at init runs unconfined and is overridden
-// per run by ConfineBash. shell is the resolved interpreter (real bash, or
-// PowerShell on a Windows host without bash); the zero value resolves lazily.
-// workDir, when non-empty, is the directory the command runs in (cmd.Dir);
-// empty uses the process cwd. timeout optionally caps foreground commands;
-// zero or negative means no tool-local cap, while parent context cancellation
-// still kills the process tree.
+// bash 实现了 bash 工具，执行 shell 命令并返回合并的 stdout/stderr。
+//
+// 特性：
+//   - 支持前台和后台执行模式（run_in_background）
+//   - 前台命令支持超时控制
+//   - 可选 OS 沙箱封装（由 ConfineBash 配置）
+//   - 跨平台：Windows 上自动使用 PowerShell 作为 shell
+//   - 后台命令支持进程组管理（清理孤儿进程）
+//
+// 字段说明：
+//   - sb: OS 沙箱规范，非零时命令通过沙箱执行
+//   - shell: 解析后的 shell 解释器（bash 或 PowerShell）
+//   - workDir: 命令工作目录，空字符串使用进程 cwd
+//   - timeout: 前台命令超时，零或负值表示无工具级限制
 type bash struct {
-	sb      sandbox.Spec
-	shell   sandbox.Shell
-	workDir string
-	timeout time.Duration
+	sb      sandbox.Spec  // OS 沙箱规范
+	shell   sandbox.Shell // 解析后的 shell 解释器
+	workDir string        // 命令工作目录
+	timeout time.Duration // 前台命令超时
 }
 
 func (bash) Name() string { return "bash" }

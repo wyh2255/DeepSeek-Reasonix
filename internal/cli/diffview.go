@@ -1,5 +1,8 @@
-// Renders a unified diff as line-numbered, syntax-highlighted rows on
-// green/red background bars with a +/- gutter.
+// diffview.go 将 unified diff 渲染为带行号、语法高亮的终端输出。
+// 使用绿色/红色背景条标识新增/删除行，带有 +/- 标记的行号槽。
+// 支持 diff 折叠（/diff-fold 切换）、tab 展开、语法高亮（通过 chroma 库）。
+// 用于在 CLI 中美观地展示文件差异。
+
 package cli
 
 import (
@@ -38,6 +41,8 @@ var (
 )
 
 // diffStat renders a change's "+A -B" tally, green/red, omitting a zero side.
+// diffStat 渲染文件变更的 "+A -B" 统计信息。
+// 新增行数显示为绿色，删除行数显示为红色，数值为零时省略。
 func diffStat(d event.FileDiff) string {
 	parts := make([]string, 0, 2)
 	if d.Added > 0 {
@@ -49,6 +54,7 @@ func diffStat(d event.FileDiff) string {
 	return strings.Join(parts, " ")
 }
 
+// diffPath 从 JSON 格式的参数中提取文件路径。
 func diffPath(args string) string {
 	var p struct {
 		Path string `json:"path"`
@@ -59,6 +65,8 @@ func diffPath(args string) string {
 
 // diffBlock renders a writer call as a header line ("✎ name path  +A -B") plus
 // the highlighted, folded diff body. Returns nil when there's no textual diff.
+// diffBlock 渲染一个完整的 diff 代码块，包括标题行（工具名、文件路径、变更统计）和高亮的 diff 内容。
+// 当没有文本差异时返回 nil。
 func diffBlock(name, args string, d event.FileDiff, width, maxLines int) []string {
 	if d.Diff == "" {
 		return nil
@@ -74,6 +82,10 @@ func diffBlock(name, args string, d event.FileDiff, width, maxLines int) []strin
 // diffBody renders the hunks with a line-number gutter, dropping the file and
 // "@@" headers (a dim "⋮" marks each hunk jump) and folding past maxLines to a
 // "+N more" footer. path selects the syntax lexer.
+// diffBody 渲染 diff 的 hunk 内容，带有行号槽。
+// 跳过文件头（--- / +++）和 @@ 行（用 "⋮" 标记 hunk 跳跃）。
+// 超过 maxLines 时折叠为 "+N more" 提示。
+// path 参数用于选择语法高亮的词法分析器。
 func diffBody(d event.FileDiff, path string, width, maxLines int) []string {
 	if d.Diff == "" {
 		return nil
@@ -132,6 +144,9 @@ func diffBody(d event.FileDiff, path string, width, maxLines int) []string {
 // diffBar draws one added/removed row on a full-width coloured background. The
 // bg is re-applied after every chroma reset — \033[0m would otherwise end the
 // bar mid-line — and padded to the bar width so it runs edge to edge.
+// diffBar 渲染一行新增/删除的 diff 行，带有全宽彩色背景。
+// sign 为 '+' 或 '-' 标记，bg 为背景色 SGR 序列，signFg 为标记符号的前景色。
+// 背景色在每个 chroma 重置后重新应用，确保颜色条完整。
 func diffBar(sign byte, code, path string, width int, bg, signFg string, lineNo, gw int) string {
 	gutter := dim(lpad(strconv.Itoa(lineNo), gw))
 	barW := width - 2 - gw - 1
@@ -152,11 +167,15 @@ func diffBar(sign byte, code, path string, width int, bg, signFg string, lineNo,
 
 // diffContext draws an unchanged line: the gutter, no background, code aligned
 // under the +/- rows' code column.
+// diffContext 渲染未变更的上下文行，带行号槽，无背景色。
+// 代码列与 +/- 行对齐。
 func diffContext(code, path string, width, lineNo, gw int) string {
 	gutter := dim(lpad(strconv.Itoa(lineNo), gw))
 	return "  " + gutter + "   " + highlightClamped(code, path, width-4-gw)
 }
 
+// gutterWidth 计算行号槽的宽度，基于 hunk 头中出现的最大行号。
+// 最小宽度为 2 个字符。
 func gutterWidth(lines []string) int {
 	max := 0
 	for _, ln := range lines {
@@ -182,6 +201,7 @@ func gutterWidth(lines []string) int {
 	return 2
 }
 
+// lpad 将字符串左填充空格到指定宽度。
 func lpad(s string, w int) string {
 	if len(s) >= w {
 		return s
@@ -189,11 +209,13 @@ func lpad(s string, w int) string {
 	return strings.Repeat(" ", w-len(s)) + s
 }
 
+// atoi 是 strconv.Atoi 的简化版本，解析失败时返回 0。
 func atoi(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
 }
 
+// highlightClamped 先截断代码到指定宽度，再进行语法高亮。
 func highlightClamped(code, path string, w int) string {
 	c := clampPlain(code, w)
 	if !colorEnabled {
@@ -202,6 +224,7 @@ func highlightClamped(code, path string, w int) string {
 	return highlightCode(path, c)
 }
 
+// clampPlain 将字符串截断到指定的终端列宽度，同时展开 tab 字符。
 func clampPlain(s string, w int) string {
 	if w < 1 {
 		w = 1
@@ -234,6 +257,8 @@ func expandTabs(s string) string {
 	return b.String()
 }
 
+// reapplyBG 在每个 ANSI 重置序列（\033[0m）后重新应用背景色。
+// 这样语法高亮的颜色重置不会同时清除 diff 行的背景色。
 func reapplyBG(s, bg string) string {
 	if s == "" {
 		return s

@@ -8,10 +8,13 @@ import (
 	"reasonix/internal/config"
 )
 
-// mcp.go holds the MCP server-management surface shared by the `reasonix mcp`
-// subcommand (config-only; takes effect next session) and the in-chat `/mcp add`
-// / `/mcp remove` slash commands (which hot-connect via the controller). Both
-// parse arguments through parseMCPAdd so the grammar is identical everywhere.
+// mcp.go 实现了 MCP (Model Context Protocol) 服务器的管理功能。
+// 该文件负责：
+//   - 解析 MCP 服务器的添加参数（支持 stdio 和远程 HTTP/SSE 两种传输方式）
+//   - 实现 `reasonix mcp` CLI 子命令（list/add/remove/import）
+//   - 提供参数分词器 tokenizeArgs，支持引号内的空格
+//   - 命令行操作仅修改配置文件，生效需要重启会话；
+//     聊天中的 /mcp add 命令则支持热连接
 
 // parseMCPAdd turns the arguments after "add" into a config.PluginEntry. Grammar:
 //
@@ -21,6 +24,13 @@ import (
 // (after the name and any --env/--header flags) begins the stdio command, and the
 // rest are its args verbatim — so the command keeps its own -flags (e.g. `npx -y
 // pkg`). Flag values accept both "--http URL" and "--http=URL" forms.
+// parseMCPAdd 将 "mcp add" 后的参数解析为 config.PluginEntry 配置项。
+// 语法格式：
+//
+//	<name> [--http URL | --sse URL] [--env K=V]... [--header K=V]... [command [args...]]
+//
+// 指定 --http/--sse URL 时为远程服务器；否则第一个非 flag token 开始 stdio 命令。
+// Flag 值支持 "--flag value" 和 "--flag=value" 两种形式。
 func parseMCPAdd(args []string) (config.PluginEntry, error) {
 	var e config.PluginEntry
 	if len(args) == 0 {
@@ -110,9 +120,9 @@ func parseMCPAdd(args []string) (config.PluginEntry, error) {
 	return e, nil
 }
 
-// tokenizeArgs splits a slash-command line into arguments, honouring "double" and
-// 'single' quotes so values with spaces (e.g. --header "Authorization=Bearer x")
-// survive. An unterminated quote takes the rest of the line as one token.
+// tokenizeArgs 将斜杠命令行分割为参数列表，支持双引号和单引号。
+// 引号内的空格不会导致分词，未闭合的引号会将剩余内容作为一个 token。
+// 例如：--header "Authorization=Bearer x" 会正确保留为一个参数。
 func tokenizeArgs(s string) []string {
 	var out []string
 	var cur strings.Builder
@@ -147,9 +157,9 @@ func tokenizeArgs(s string) []string {
 	return out
 }
 
-// mcpCommand implements `reasonix mcp <add|remove|list>`. It edits config only
-// (validate → UpsertPlugin/RemovePlugin → Save); the server connects on the next
-// session start. For a live connect inside an open chat, use `/mcp add`.
+// mcpCommand 实现 `reasonix mcp <add|remove|list|import>` 子命令入口。
+// 仅修改配置文件（验证 -> UpsertPlugin/RemovePlugin -> 保存），
+// 服务器在下次会话启动时连接。要在当前聊天中实时连接，请使用 /mcp add。
 func mcpCommand(args []string) int {
 	if len(args) == 0 {
 		mcpUsage()
@@ -174,6 +184,7 @@ func mcpCommand(args []string) int {
 	}
 }
 
+// mcpImportCLI 从 cc-switch 配置导入 MCP 服务器到 reasonix 配置中。
 func mcpImportCLI() int {
 	total, added, updated, err := config.ImportCCSwitchMCP()
 	if err != nil {
@@ -184,6 +195,7 @@ func mcpImportCLI() int {
 	return 0
 }
 
+// mcpList 列出所有已配置的 MCP 服务器，显示名称、传输类型和连接信息。
 func mcpList() int {
 	cfg, err := config.Load()
 	if err != nil {
@@ -214,6 +226,7 @@ func mcpList() int {
 	return 0
 }
 
+// mcpAddCLI 处理命令行的 MCP 服务器添加操作，解析参数后写入配置文件。
 func mcpAddCLI(args []string) int {
 	entry, err := parseMCPAdd(args)
 	if err != nil {
@@ -237,6 +250,7 @@ func mcpAddCLI(args []string) int {
 	return 0
 }
 
+// mcpRemoveCLI 处理命令行的 MCP 服务器移除操作，从配置文件中删除指定服务器。
 func mcpRemoveCLI(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: reasonix mcp remove <name>")
@@ -260,6 +274,7 @@ func mcpRemoveCLI(args []string) int {
 	return 0
 }
 
+// mcpUsage 输出 MCP 子命令的使用帮助信息。
 func mcpUsage() {
 	fmt.Println(`Manage MCP servers (persisted to reasonix.toml).
 

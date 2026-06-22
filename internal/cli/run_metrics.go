@@ -1,3 +1,7 @@
+// run_metrics.go 实现了运行指标的收集和持久化功能。
+// metricsSink 作为事件接收器，累计每次模型调用的 token 使用量、缓存命中率和成本，
+// 最终通过 writeMetrics 将结构化的 RunMetrics 写入 JSON 文件，
+// 供基准测试工具读取而无需解析标准输出。
 package cli
 
 import (
@@ -8,8 +12,8 @@ import (
 	"reasonix/internal/evidence"
 )
 
-// RunMetrics is the machine-readable token/cache/cost summary `run --metrics`
-// writes, so a benchmark harness can read a run's cost without scraping stdout.
+// RunMetrics 是机器可读的 token/缓存/成本汇总结构体，
+// 由 `run --metrics` 写入，供基准测试工具读取运行成本而无需解析标准输出。
 type RunMetrics struct {
 	PromptTokens                  int     `json:"prompt_tokens"`
 	CompletionTokens              int     `json:"completion_tokens"`
@@ -29,14 +33,16 @@ type RunMetrics struct {
 	ReadinessCommandMismatches    int     `json:"readiness_command_mismatches"`
 }
 
-// metricsSink forwards every event to the real sink and accumulates the per-call
-// Usage events into a RunMetrics. Cache totals are summed per call (not read from
-// the cumulative SessionHit/Miss) so they match PromptTokens exactly.
+// metricsSink 将每个事件转发给真实的 sink，同时将每次调用的 Usage 事件
+// 累积到 RunMetrics 中。缓存总量按每次调用求和（而非从累计的 SessionHit/Miss 读取），
+// 使其与 PromptTokens 精确匹配。
 type metricsSink struct {
 	inner event.Sink
 	m     RunMetrics
 }
 
+// Emit 处理每个事件：累计 Usage 事件中的 token 计数和成本，
+// 统计 CompactionStarted 事件，并将事件转发给内部的真实 sink。
 func (s *metricsSink) Emit(e event.Event) {
 	if e.Kind == event.Usage && e.Usage != nil {
 		u := e.Usage
@@ -58,6 +64,8 @@ func (s *metricsSink) Emit(e event.Event) {
 	s.inner.Emit(e)
 }
 
+// RecordReadinessAudit 累积就绪性审计的统计数据，包括检查次数、
+// 允许/阻止/错误计数、恢复次数以及缺失项目检查等指标。
 func (s *metricsSink) RecordReadinessAudit(a evidence.ReadinessAudit) {
 	if s == nil {
 		return
@@ -79,6 +87,7 @@ func (s *metricsSink) RecordReadinessAudit(a evidence.ReadinessAudit) {
 	s.m.ReadinessCommandMismatches += a.CommandMismatchMissing
 }
 
+// writeMetrics 将 RunMetrics 以格式化的 JSON 写入指定文件路径。
 func writeMetrics(path string, m RunMetrics) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {

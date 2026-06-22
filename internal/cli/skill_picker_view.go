@@ -1,3 +1,14 @@
+// skill_picker_view.go 实现了技能选择器的视图渲染逻辑。
+// 该文件负责将技能选择器的各个视图模式（技能列表、来源列表、来源内技能、详情、确认删除）
+// 渲染为终端可显示的字符串。
+//
+// 核心职责：
+//   - 渲染技能列表视图（带搜索框、分组、窗口滚动）
+//   - 渲染来源目录列表视图
+//   - 渲染某来源下的技能列表视图
+//   - 渲染技能详情视图（含操作按钮）
+//   - 渲染删除确认视图
+//   - 提供各种辅助渲染函数（行样式、摘要、路径压缩等）
 package cli
 
 import (
@@ -8,11 +19,14 @@ import (
 	"reasonix/internal/skill"
 )
 
+// 技能选择器对话框的行数限制常量。
 const (
-	skillDialogMinRows = 8
-	skillDialogMaxRows = 18
+	skillDialogMinRows = 8  // 最小可见行数
+	skillDialogMaxRows = 18 // 最大可见行数
 )
 
+// renderSkillPicker 根据当前选择器模式渲染对应的视图面板。
+// 返回空字符串表示选择器未打开。
 func (m chatTUI) renderSkillPicker() string {
 	p := m.skillPick
 	if p == nil {
@@ -34,6 +48,7 @@ func (m chatTUI) renderSkillPicker() string {
 	return ""
 }
 
+// skillPickerFooterHint 返回当前选择器模式对应的底部提示文本。
 func (m chatTUI) skillPickerFooterHint() string {
 	if m.skillPick == nil {
 		return ""
@@ -54,6 +69,8 @@ func (m chatTUI) skillPickerFooterHint() string {
 	}
 }
 
+// renderSkillPickerSkills 渲染技能列表视图：标题、摘要、搜索框、分组技能列表。
+// 支持搜索过滤和窗口滚动（只显示可见范围内的技能）。
 func (m chatTUI) renderSkillPickerSkills() string {
 	p := m.skillPick
 	w := max(viewWidth(m.width), 40)
@@ -103,6 +120,8 @@ func (m chatTUI) renderSkillPickerSkills() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// skillPickerVisibleRows 根据终端高度计算技能列表的可见行数，
+// 在最小值和最大值之间取平衡。
 func (m chatTUI) skillPickerVisibleRows() int {
 	if m.height <= 0 {
 		return skillDialogMaxRows
@@ -110,6 +129,8 @@ func (m chatTUI) skillPickerVisibleRows() int {
 	return min(skillDialogMaxRows, max(skillDialogMinRows, m.height-14))
 }
 
+// skillListWindow 计算列表窗口的起止索引，使选中项保持在可见范围内。
+// 返回 (start, end) 表示当前应显示的元素范围。
 func skillListWindow(sel, total, limit int) (int, int) {
 	if total <= 0 {
 		return 0, 0
@@ -133,6 +154,7 @@ func skillListWindow(sel, total, limit int) (int, int) {
 	return start, start + limit
 }
 
+// renderSkillSearchBox 渲染搜索输入框，显示当前查询文本或占位符。
 func renderSkillSearchBox(query string, active bool, w int) string {
 	boxWidth := max(8, w-4)
 	innerWidth := max(1, boxWidth-4)
@@ -151,6 +173,7 @@ func renderSkillSearchBox(query string, active bool, w int) string {
 	return b.String()
 }
 
+// renderSkillPickerSources 渲染来源目录列表视图，显示每个来源的路径、作用域、状态和技能数量。
 func (m chatTUI) renderSkillPickerSources() string {
 	p := m.skillPick
 	var b strings.Builder
@@ -177,6 +200,7 @@ func (m chatTUI) renderSkillPickerSources() string {
 	return b.String()
 }
 
+// renderSkillPickerSourceSkills 渲染某来源目录下的技能列表视图，显示该来源中包含的所有技能。
 func (m chatTUI) renderSkillPickerSourceSkills() string {
 	p := m.skillPick
 	var b strings.Builder
@@ -211,6 +235,7 @@ func (m chatTUI) renderSkillPickerSourceSkills() string {
 	return b.String()
 }
 
+// renderSkillPickerDetail 渲染技能详情视图，显示技能名称、元数据、状态、操作按钮和正文预览。
 func (m chatTUI) renderSkillPickerDetail() string {
 	p := m.skillPick
 	var b strings.Builder
@@ -235,6 +260,8 @@ func (m chatTUI) renderSkillPickerDetail() string {
 	return b.String()
 }
 
+// renderSkillPickerConfirmDelete 渲染删除确认视图，显示待删除技能的名称和路径，
+// 以及确认/取消两个操作选项。
 func (m chatTUI) renderSkillPickerConfirmDelete() string {
 	p := m.skillPick
 	var b strings.Builder
@@ -252,6 +279,8 @@ func (m chatTUI) renderSkillPickerConfirmDelete() string {
 	return b.String()
 }
 
+// renderSkillRow 渲染技能列表中的一行，包含序号、名称、启用状态和元数据。
+// 选中行会以反色高亮显示。
 func renderSkillRow(num int, selected bool, s skill.Skill, enabled bool, w int) string {
 	prefix := "    "
 	if selected {
@@ -282,10 +311,12 @@ func renderSkillRow(num int, selected bool, s skill.Skill, enabled bool, w int) 
 	return line
 }
 
+// skillGroupLabel 返回技能作用域对应的分组标题文本。
 func skillGroupLabel(sc skill.Scope) string {
 	return titleText(scopeLabel(sc)) + " skills"
 }
 
+// skillRowMeta 生成技能行的元数据文本，包含作用域、子代理标记和近似 token 数。
 func skillRowMeta(s skill.Skill) string {
 	parts := []string{scopeLabel(s.Scope)}
 	if s.RunAs == skill.RunSubagent {
@@ -295,6 +326,8 @@ func skillRowMeta(s skill.Skill) string {
 	return strings.Join(parts, " · ")
 }
 
+// approxSkillTokens 估算技能内容的 token 数量，用于在列表中显示技能大小。
+// 使用字符数/4 和单词数的较大值作为估算，向下取整到 10 的倍数。
 func approxSkillTokens(s skill.Skill) int {
 	text := strings.TrimSpace(s.Body)
 	if text == "" {
@@ -310,6 +343,7 @@ func approxSkillTokens(s skill.Skill) int {
 	return ((estimate + 9) / 10) * 10
 }
 
+// sourceRowLabel 生成来源目录列表中一行的显示文本，包含路径、作用域、状态和技能数量。
 func sourceRowLabel(r skillRootLine, w int) string {
 	path := viewCompactPath(r.dir, max(8, w-40))
 	scope := dim(scopeLabel(r.scope))
@@ -323,6 +357,8 @@ func sourceRowLabel(r skillRootLine, w int) string {
 	return fmt.Sprintf("%s  %s  %s  %s", path, scope, status, skills)
 }
 
+// skillPickerSummary 生成技能选择器的摘要文本，显示技能总数和按作用域的分布。
+// 搜索模式下显示匹配数量。
 func skillPickerSummary(p *skillPicker) string {
 	if len(p.skills) == 0 {
 		return ""
@@ -345,6 +381,7 @@ func skillPickerSummary(p *skillPicker) string {
 	return strings.Join(parts, " · ")
 }
 
+// skillSourceSummary 生成来源目录的摘要文本，显示包含技能的活跃来源数量。
 func skillSourceSummary(roots []skillRootLine) string {
 	active := 0
 	for _, r := range roots {
@@ -358,6 +395,7 @@ func skillSourceSummary(roots []skillRootLine) string {
 	return fmt.Sprintf(i18n.M.SkillPickerSourceActiveFmt, active)
 }
 
+// renderSkillDetail 渲染技能的完整详情，包括头部信息和正文预览。
 func renderSkillDetail(s skill.Skill, w int) string {
 	var b strings.Builder
 	b.WriteString(renderSkillDetailHeader(s, w))
@@ -368,6 +406,7 @@ func renderSkillDetail(s skill.Skill, w int) string {
 	return b.String()
 }
 
+// renderSkillDetailHeader 渲染技能详情的头部信息，包括名称、元数据、路径和描述。
 func renderSkillDetailHeader(s skill.Skill, w int) string {
 	var b strings.Builder
 	b.WriteString(accent("/" + s.Name))
@@ -391,6 +430,7 @@ func renderSkillDetailHeader(s skill.Skill, w int) string {
 	return b.String()
 }
 
+// renderSkillBodyPreview 渲染技能正文的预览，限制最大行数，超出部分显示 "+N lines" 提示。
 func renderSkillBodyPreview(s skill.Skill, w, maxLines int) string {
 	body, extra := viewBodyPreview(s.Body, maxLines)
 	if body == "" {
@@ -406,6 +446,7 @@ func renderSkillBodyPreview(s skill.Skill, w, maxLines int) string {
 	return b.String()
 }
 
+// scopeLabel 返回技能作用域的本地化显示标签。
 func scopeLabel(sc skill.Scope) string {
 	switch sc {
 	case skill.ScopeProject:
@@ -421,6 +462,7 @@ func scopeLabel(sc skill.Scope) string {
 	}
 }
 
+// statusLabel 返回技能路径状态的本地化显示标签。
 func statusLabel(st skill.PathStatus) string {
 	switch st {
 	case skill.StatusOK:

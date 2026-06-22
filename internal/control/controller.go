@@ -1,13 +1,20 @@
-// Package control is the transport-agnostic session driver. A Controller owns
-// the agent run loop and session lifecycle, takes commands (Send/Cancel/Approve/
-// SetPlanMode/Compact/NewSession/…), and emits everything that happens —
-// reasoning, tool calls, approvals, turn completion — as a typed event stream to
-// a single event.Sink.
+// 文件：controller.go
 //
-// The point is one orchestration layer behind every frontend: a terminal TUI, a
-// desktop webview, or an HTTP/SSE server each drive the Controller identically
-// (issue commands, render events) and none of them re-implement turn lifecycle,
-// cancellation, or approval. The Controller depends on no frontend.
+// 控制器核心实现——传输无关的会话驱动器。
+// Controller 拥有代理运行循环和会话生命周期，接收命令（Send/Cancel/Approve/
+// SetPlanMode/Compact/NewSession 等），并将发生的一切——推理、工具调用、
+// 审批、轮次完成——作为类型化事件流发射到单个 event.Sink。
+//
+// 设计目标：为每个前端提供统一的编排层。终端 TUI、桌面 webview 和
+// HTTP/SSE 服务器都以相同方式驱动 Controller（发出命令、渲染事件），
+// 没有任何前端需要重新实现轮次生命周期、取消或审批。Controller 不依赖任何前端。
+//
+// 架构概览：
+//   - Controller 是 SessionAPI 接口的具体实现，由 New() 构造
+//   - 内部委托给多个协作者：approvalManager（审批）、goalMachine（目标 FSM）、
+//     checkpoint.Store（检查点）、agent.Runner（模型运行）、plugin.Host（MCP）等
+//   - 所有状态变更通过 mu 互斥锁保护，每个临界区尽量短且非阻塞
+//   - 协作者使用独立的锁（approval.mu、goals.mu），避免锁反转
 package control
 
 import (
@@ -60,121 +67,136 @@ var ErrTurnRunning = errors.New("turn already running")
 // (#4414). Callers log it and continue; it must never be swallowed quietly.
 var errNoSessionPath = errors.New("session has content but no session path; conversation cannot be persisted")
 
-// Controller drives one chat session. Construct with New; drive with the command
-// methods; observe through the Sink passed in Options.
+// Controller 驱动一个聊天会话。通过 New 构造；通过命令方法驱动；
+// 通过 Options 中传入的 Sink 观察事件。
+//
+// 核心字段分为几个职责域：
+//   - 模型运行：runner（规划器）、executor（执行器/代理）、sink（事件发射）
+//   - 安全策略：policy（权限策略）、approval（审批管理器）
+//   - 会话元数据：label、modelRef、systemPrompt、sessionDir、sessionPath
+//   - 可插拟能力：host（MCP）、commands、skills、hooks
+//   - 记忆系统：mem、memMu
+//   - 检查点：cp、cpRoot、cpTurn、cpBound
+//   - 目标 FSM：goals
+//   - 后台作业：jobs
+//   - 运行状态：mu、cancel、running、canceling
 type Controller struct {
-	runner   agent.Runner
-	executor *agent.Agent
-	sink     event.Sink
-	policy   permission.Policy
+	// --- 模型运行 ---
+	runner   agent.Runner    // 模型运行器（可能是双模型规划+执行的包装）
+	executor *agent.Agent    // 执行器代理，持有会话、工具和运行时状态
+	sink     event.Sink      // 事件发射器，所有输出（推理、工具调用、审批等）通过此发出
+	policy   permission.Policy // 不可变的基础权限策略，在构造时捕获
 
-	label         string
-	modelRef      string
-	systemPrompt  string
-	sessionDir    string
-	host          *plugin.Host
-	commands      atomic.Pointer[[]command.Command]
-	skills        []skill.Skill
-	allSkills     []skill.Skill
-	skillStore    *skill.Store
-	allSkillStore *skill.Store
-	hooks         *hook.Runner // session hook runner; nil-safe (no hooks configured)
-	mem           *memory.Set
-	// memMu serializes memory mutations (QuickAdd/SaveDoc/SaveMemory/ForgetMemory/
-	// QueueMemory) so each write+reload+swap is atomic with respect to the others,
-	// WITHOUT holding c.mu across the disk I/O. c.mu is taken only briefly — to read
-	// the snapshot pointer and to swap the reloaded snapshot in — never around a
-	// filesystem walk, so a memory-panel save can't stall an approval or status poll.
+	// --- 会话元数据 ---
+	label         string            // 人类可读的模型标签，如 "deepseek-flash"
+	modelRef      string            // 当前模型引用，用于侧边栏元数据
+	systemPrompt  string            // 系统提示，注入到每个新会话
+	sessionDir    string            // 新会话文件存放的目录（"" 禁用持久化）
+
+	// --- 可插拟能力 ---
+	host          *plugin.Host      // MCP 宿主，管理插件服务器连接（无插件时为 nil）
+	commands      atomic.Pointer[[]command.Command] // 已加载的自定义斜杠命令（原子指针，支持热重载）
+	skills        []skill.Skill     // 可发现的技能列表
+	allSkills     []skill.Skill     // 所有技能（包括已禁用的）
+	skillStore    *skill.Store      // 活动技能存储（运行时安装的技能通过此发现）
+	allSkillStore *skill.Store      // 全部技能存储
+	hooks         *hook.Runner      // 会话钩子运行器；nil 安全（无钩子配置时为 nil）
+
+	// --- 记忆系统 ---
+	mem *memory.Set // 记忆快照（不可变指针）；读取短暂持有 c.mu，写入通过 memMu 序列化
+	// memMu 序列化记忆变更（QuickAdd/SaveDoc/SaveMemory/ForgetMemory/QueueMemory），
+	// 使每次写入+重新加载+交换对其他操作是原子的，同时不在磁盘 I/O 期间持有 c.mu。
+	// c.mu 仅短暂持有——读取快照指针和交换重新加载的快照——永远不会围绕文件系统遍历。
 	memMu             sync.Mutex
-	cleanup           func()
-	autoPlan          string
-	reasoningLanguage string
-	// disableColdResumePrune skips stale-tool-result elision on cold resume.
-	// Zero value keeps the prune on (the cheaper default).
+	cleanup           func()        // 析构回调，在 Close 时调用
+	autoPlan          string        // 自动计划模式："off" 或 "on"
+	reasoningLanguage string        // 可见推理语言偏好（空/auto 表示跟随对话语言）
+	// disableColdResumePrune 在冷恢复时跳过过时工具结果的剪枝。
+	// 零值保持剪枝开启（更便宜的默认值）。
 	disableColdResumePrune bool
-	shell                  sandbox.Shell // interpreter for user-invoked "!" commands; zero = auto
-	classifier             autoPlanClassifier
-	startedOnce            bool                             // guards the one-shot SessionStart hook on first turn
-	onRemember             func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
+	shell                  sandbox.Shell // 用户调用 "!" 命令的解释器；零值 = 自动
+	classifier             autoPlanClassifier // 自动计划分类器（可选的 LLM 分类器）
+	startedOnce            bool              // 守卫首次轮次上的 SessionStart 钩子（一次性触发）
+	onRemember             func(rule string) RememberResult // 用户选择"始终允许"时的回调
 
-	// balanceURL/balanceKey target the active provider's optional wallet-balance
-	// endpoint (empty when the provider declares none). Captured at build so a
-	// model/key switch — which rebuilds the controller — refreshes them.
+	// --- 计费 ---
+	// balanceURL/balanceKey 指向活动提供商的可选钱包余额端点（提供商未声明时为空）。
+	// 在构造时捕获，以便模型/密钥切换（重建控制器）时刷新。
 	balanceURL    string
 	balanceKey    string
 	balanceClient *http.Client
 
-	// jobs is the session-scoped background-job manager. The agent's background
-	// tools spawn into it; Compose drains its completion notes into the next turn;
-	// Close cancels its still-running jobs.
+	// --- 后台作业 ---
+	// jobs 是会话范围的后台作业管理器。代理的后台工具在此生成；
+	// Compose 将其完成注释排入下一个轮次；Close 取消仍在运行的作业。
 	jobs *jobs.Manager
 
-	// reg is the live tool registry the executor reads each turn; pluginCtx is the
-	// session-scoped context a hot-added stdio server binds its subprocess to.
-	// Together they let AddMCPServer connect a server mid-session and have its tools
-	// available on the next turn (see AddMCPServer / RemoveMCPServer).
+	// --- 工具注册表 ---
+	// reg 是执行器每轮次读取的活动工具注册表；pluginCtx 是热添加的 stdio 服务器
+	// 绑定其子进程的会话范围上下文。两者一起让 AddMCPServer 能在会话中连接服务器
+	// 并使其工具在下一个轮次可用。
 	reg       *tool.Registry
 	pluginCtx context.Context
 
-	// goals owns the active goal's FSM (status, intercepts, idle/turn counters)
-	// and its persistence, behind its own mutex so a per-turn goal save never
-	// stalls an approval or status poll on c.mu. See goal.go.
+	// --- 目标 FSM ---
+	// goals 拥有活动目标的有限状态机（状态、拦截、空闲/轮次计数器）及其持久化，
+	// 使用自己的互斥锁，使每轮次的目标保存永远不会因 c.mu 而阻塞审批或状态轮询。
+	// 详见 goal.go。
 	goals goalMachine
 
-	// Checkpoints (snapshot-based rewind). cp is the per-session store rebound when
-	// the session path changes; cpRoot is the workspace root used to guard restore
-	// writes. cpTurn is the monotonic turn counter (decoupled from the store so it
-	// never collides after a restructure); cpBound[turn] records len(Session.Messages)
-	// at that turn's start — the truncation boundary for a conversation rewind/fork.
-	// Boundaries are persisted in each checkpoint and rebuilt from the store on
-	// resume (so a reopened session can still rewind conversation / fork), but
-	// dropped after a summarize restructures the log so those operations report
-	// "unavailable" rather than mis-truncating; code rewind (file-based) is unaffected.
+	// --- 检查点（基于快照的回退） ---
+	// cp 是会话路径更改时重新绑定的每会话存储；cpRoot 是用于保护恢复写入的工作区根。
+	// cpTurn 是单调轮次计数器（与存储解耦，重构后永不冲突）；
+	// cpBound[turn] 记录该轮次开始时的 len(Session.Messages)——对话回退/分叉的截断边界。
+	// 边界在每个检查点中持久化，并在恢复时从存储重建（以便重新打开的会话仍可回退/分叉），
+	// 但在摘要重构日志后丢弃，使这些操作报告"不可用"而非错误截断；
+	// 代码回退（基于文件）不受影响。
 	cp      *checkpoint.Store
-	cpRoot  string
-	cpTurn  int
-	cpBound map[int]int
+	cpRoot  string            // 工作区根目录，用于保护文件恢复写入
+	cpTurn  int               // 单调递增的轮次计数器
+	cpBound map[int]int       // 轮次 -> 消息日志索引的映射（回退边界）
 
-	// approval owns the approval/ask prompt bookkeeping and the runtime approval
-	// posture (ask/auto/yolo, session grants, the just-approved-plan window)
-	// behind its own locks, off c.mu. The Controller keeps the I/O orchestration
-	// (requestApproval/Ask emit events + fire hooks + rebuild the executor gate).
-	// See approval.go.
+	// --- 审批管理 ---
+	// approval 拥有审批/提问提示的簿记和运行时审批姿态（ask/auto/yolo、会话授权、
+	// 刚批准的计划窗口），使用自己的锁，不在 c.mu 上。Controller 保留 I/O 编排
+	//（requestApproval/Ask 发出事件 + 触发钩子 + 重建执行器门控）。详见 approval.go。
 	approval approvalManager
 
-	// mu guards the run state; every critical section under it is short and
-	// non-blocking.
+	// --- 运行状态（受 c.mu 保护） ---
 	mu          sync.Mutex
-	cancel      context.CancelFunc
-	running     bool
-	canceling   bool
-	autosaveWG  sync.WaitGroup
-	planMode    bool
-	sessionPath string
-	// turn counts model turns this session, passed to hooks in their payload.
+	cancel      context.CancelFunc // 当前轮次的取消函数
+	running     bool               // 是否有轮次正在飞行
+	canceling   bool               // 是否已请求取消
+	autosaveWG  sync.WaitGroup     // 自动保存 goroutine 的等待组
+	planMode    bool               // 计划模式是否开启
+	sessionPath string             // 当前对话自动保存的文件路径
+	// turn 计数本会话的模型轮次，传递给钩子的负载中。
 	turn int
 
-	// pendingMemory holds memory notes added mid-session (via "#" quick-add or a
-	// memory edit) that haven't yet been folded into a turn. Compose drains it
-	// onto the next outgoing turn — never into the cache-stable system prefix — so
-	// a fresh memory takes effect this session without busting the prompt cache;
-	// it joins the prefix naturally on the next session.
+	// pendingMemory 持有会话中添加的记忆注释（通过 "#" 快速添加或记忆编辑），
+	// 尚未折叠到轮次中。Compose 将其排入下一个出站轮次——永远不会进入缓存稳定的
+	// 系统前缀——因此新记忆在本会话中立即生效而不破坏提示缓存；
+	// 在下一个会话中它自然加入前缀。
 	pendingMemory []string
 
+	// displayRecorder 是可选的显示记录钩子，供前端持久化比完整模型提示更短的
+	// 用户界面转录使用。
 	displayRecorder func(content, display string)
 }
 
+// approvalReply 是审批请求的回复。通过缓冲通道传递，永不阻塞。
 type approvalReply struct {
-	allow   bool
-	session bool
-	persist bool // true = write "always allow" rule to config
+	allow   bool // 是否允许工具调用
+	session bool // 是否在本会话范围内记住授权
+	persist bool // 是否将"始终允许"规则写入配置文件
 }
 
+// pendingApproval 表示一个等待用户决策的待处理工具审批。
 type pendingApproval struct {
-	tool      string
-	subject   string
-	autoDrain bool
-	reply     chan approvalReply
+	tool      string            // 工具名称（如 "bash"、"write_file"）
+	subject   string            // 审批主题（如文件路径、命令内容）
+	autoDrain bool              // 在 auto 模式下是否可自动排空（策略允许的写者工具）
+	reply     chan approvalReply // 用户回复的缓冲通道
 }
 
 // pendingAsk is an in-flight ask question batch. questions is retained so the
@@ -189,22 +211,21 @@ type plannerSessionResetter interface {
 	ResetPlannerSession()
 }
 
-// RuntimeStatus is the frontend-facing snapshot of foreground turn state. It is
-// intentionally more explicit than the legacy Running bool so UI code can
-// distinguish a cancellable foreground turn from pending prompts and background
-// jobs.
+// RuntimeStatus 是前台轮次状态的前端面向快照。它比遗留的 Running bool
+// 更加显式，以便 UI 代码可以区分可取消的前台轮次、待处理提示和后台作业。
 type RuntimeStatus struct {
-	Running         bool
-	PendingPrompt   bool
-	BackgroundJobs  int
-	CancelRequested bool
-	Cancellable     bool
+	Running         bool // 是否有前台轮次正在飞行
+	PendingPrompt   bool // 是否有审批/提问提示正在等待用户决策
+	BackgroundJobs  int  // 仍在运行的后台作业数量
+	CancelRequested bool // 是否已对活动轮次请求了取消
+	Cancellable     bool // 当前状态是否可取消（正在运行或有待处理提示）
 }
 
+// 工具审批姿态常量——控制工具调用前是否需要用户批准。
 const (
-	ToolApprovalAsk  = "ask"
-	ToolApprovalAuto = "auto"
-	ToolApprovalYolo = "yolo"
+	ToolApprovalAsk  = "ask"  // 每次工具调用都询问用户（默认）
+	ToolApprovalAuto = "auto" // 策略允许的写者工具自动批准，其他仍询问
+	ToolApprovalYolo = "yolo" // 跳过所有工具审批提示（计划审批除外）
 )
 
 const (
@@ -212,75 +233,70 @@ const (
 	memoryForgetTool   = "forget"
 )
 
-// RememberResult describes what happened when an approval rule was persisted.
+// RememberResult 描述审批规则持久化后发生的事情。
 type RememberResult struct {
-	Rule      string
-	Path      string
-	Saved     bool
-	CoveredBy string
-	Err       error
+	Rule      string // 被持久化的规则（如 "Bash(go test:*)"）
+	Path      string // 写入的配置文件路径
+	Saved     bool   // 规则是否成功保存
+	CoveredBy string // 已有的覆盖此规则的现有规则（如存在）
+	Err       error  // 持久化过程中的错误
 }
 
-// Options carries the already-built pieces setup assembles. Lifecycle metadata
-// lets the controller mint and rotate session files; Host/Commands are surfaced
-// to frontends that resolve MCP prompts and slash commands.
+// Options 携带组装阶段已构建的各个组件。生命周期元数据让控制器可以生成和
+// 轮转会话文件；Host/Commands 暴露给解析 MCP 提示和斜杠命令的前端。
 type Options struct {
-	Runner        agent.Runner
-	Executor      *agent.Agent
-	Sink          event.Sink
-	Policy        permission.Policy
-	Label         string
-	ModelRef      string
-	SystemPrompt  string
-	SessionDir    string
-	SessionPath   string
-	Host          *plugin.Host
-	Commands      []command.Command
-	Skills        []skill.Skill
-	AllSkills     []skill.Skill
-	SkillStore    *skill.Store
-	AllSkillStore *skill.Store
-	Hooks         *hook.Runner
-	Memory        *memory.Set
-	Cleanup       func()
-	// BalanceURL/BalanceKey wire the active provider's optional wallet-balance
-	// endpoint and bearer key; empty when the provider declares no balance_url.
+	Runner        agent.Runner        // 模型运行器（可能是双模型包装）
+	Executor      *agent.Agent        // 执行器代理
+	Sink          event.Sink          // 事件发射器（nil 被替换为 event.Discard）
+	Policy        permission.Policy   // 基础权限策略
+	Label         string              // 模型标签（如 "deepseek-flash"）
+	ModelRef      string              // 模型引用，用于侧边栏元数据
+	SystemPrompt  string              // 系统提示文本
+	SessionDir    string              // 会话文件目录（"" 禁用持久化）
+	SessionPath   string              // 初始会话文件路径
+	Host          *plugin.Host        // MCP 宿主（可选）
+	Commands      []command.Command   // 自定义斜杠命令
+	Skills        []skill.Skill       // 可发现的技能
+	AllSkills     []skill.Skill       // 所有技能（包括已禁用的）
+	SkillStore    *skill.Store        // 活动技能存储
+	AllSkillStore *skill.Store        // 全部技能存储
+	Hooks         *hook.Runner        // 钩子运行器
+	Memory        *memory.Set         // 初始记忆快照
+	Cleanup       func()              // 析构回调
+	// BalanceURL/BalanceKey 连接活动提供商的可选钱包余额端点和 bearer 密钥；
+	// 提供商未声明 balance_url 时为空。
 	BalanceURL    string
 	BalanceKey    string
 	BalanceClient *http.Client
-	// Jobs is the session-scoped background-job manager (nil disables background jobs).
+	// Jobs 是会话范围的后台作业管理器（nil 禁用后台作业）。
 	Jobs *jobs.Manager
-	// Registry is the executor's live tool set, and PluginCtx the session-scoped
-	// context; both are needed for hot-adding MCP servers via AddMCPServer.
+	// Registry 是执行器的活动工具集，PluginCtx 是会话范围的上下文；
+	// 两者都是通过 AddMCPServer 热添加 MCP 服务器所必需的。
 	Registry  *tool.Registry
 	PluginCtx context.Context
-	// WorkspaceRoot is the project root checkpoint restores are confined to ("" =
-	// no confinement). Frontends pass the cwd they launched the session in.
+	// WorkspaceRoot 是检查点恢复所限定的项目根目录（"" = 不限定）。
+	// 前端传递启动会话时的 cwd。
 	WorkspaceRoot string
-	AutoPlan      string
-	// ReasoningLanguage controls visible reasoning language preference. Empty/auto
-	// means no transient injection because the stable language policy already
-	// follows the conversation language.
+	AutoPlan      string              // 自动计划模式："off" 或 "on"
+	// ReasoningLanguage 控制可见推理语言偏好。空/auto 表示不注入瞬态标记，
+	// 因为稳定的语言策略已经跟随对话语言。
 	ReasoningLanguage string
-	// DisableColdResumePrune skips the stale-tool-result elision that otherwise
-	// runs when a session resumes past the provider cache window. Zero value
-	// keeps the prune on (the cheaper default).
+	// DisableColdResumePrune 跳过当会话恢复超过提供商缓存窗口时运行的
+	// 过时工具结果剪枝。零值保持剪枝开启（更便宜的默认值）。
 	DisableColdResumePrune bool
-	// Shell is the interpreter user-invoked "!" commands run under, so /shell
-	// matches the agent's configured [tools.shell] choice. Zero value = auto.
+	// Shell 是用户调用 "!" 命令运行的解释器，使 /shell 匹配代理配置的
+	// [tools.shell] 选择。零值 = 自动。
 	Shell      sandbox.Shell
-	Classifier autoPlanClassifier
-	// OnRemember, when set, is invoked with a new allow rule the user chose to
-	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
-	// permission Gate on EnableInteractiveApproval.
+	Classifier autoPlanClassifier // 自动计划分类器（可选的 LLM 分类器）
+	// OnRemember 设置后，当用户选择持久化新的允许规则到磁盘时被调用
+	//（如 "Bash(go test:*)"）。回调在 EnableInteractiveApproval 时接入权限门控。
 	OnRemember func(rule string) RememberResult
-	// PlanModeAllowedTools names tools exempt from the plan-mode read-only gate.
-	// Passed through to the executor agent so user-configured exceptions work.
+	// PlanModeAllowedTools 列出豁免于计划模式只读门控的工具名称。
+	// 传递给执行器代理，使用户配置的例外生效。
 	PlanModeAllowedTools []string
-	// ApprovalTimeout bounds how long a tool-approval or ask prompt blocks waiting
-	// for a user decision. Zero (default) waits forever — right for an interactive
-	// terminal. Bot/headless frontends set a positive value so an unanswered
-	// prompt can't wedge the session indefinitely (#4626, #4402).
+	// ApprovalTimeout 限制工具审批或提问提示等待用户决策的时间。
+	// 零值（默认）无限等待——适合交互式终端。
+	// Bot/无头前端设置正值，以防未回答的提示无限期阻塞会话（#4626, #4402）。
 	ApprovalTimeout time.Duration
 }
 
@@ -1682,13 +1698,13 @@ func ReconcileCleanupPending(dir string) error {
 	})
 }
 
-// RewindScope selects what a Rewind restores.
+// RewindScope 选择回退操作恢复什么内容。
 type RewindScope int
 
 const (
-	RewindCode         RewindScope = iota // files only
-	RewindConversation                    // message log only
-	RewindBoth                            // both
+	RewindCode         RewindScope = iota // 仅恢复文件（代码回退）
+	RewindConversation                    // 仅截断消息日志（对话回退）
+	RewindBoth                            // 同时恢复文件和对话
 )
 
 // Checkpoints lists the session's rewind points (one per user turn), oldest first.
@@ -2217,13 +2233,14 @@ func (c *Controller) SetSessionPath(p string) {
 	c.rebindCheckpoints(p)
 }
 
-// SessionDestroyHandle separates waiting for cancelled jobs from ending the
-// destroy window, so callers can move/delete persistent artifacts in between.
+// SessionDestroyHandle 将等待已取消的作业与结束销毁窗口分离，
+// 以便调用者可以在两者之间移动/删除持久化工件。
+// 调用流程：BeginDestroySession → Wait（等待作业完成）→ 移动/删除文件 → Finish。
 type SessionDestroyHandle struct {
-	Wait    func() jobs.TeardownResult
-	WaitAll func()
-	Finish  func()
-	Async   bool
+	Wait    func() jobs.TeardownResult // 等待作业拆卸完成（有宽限期）
+	WaitAll func()                     // 等待所有作业通道关闭（无超时）
+	Finish  func()                     // 完成销毁窗口，清理临时工件
+	Async   bool                       // 是否异步拆卸（需要后台等待）
 }
 
 // BeginDestroySession marks a session as leaving active use and cancels its
@@ -2334,11 +2351,11 @@ func (c *Controller) SessionCache() (hit, miss int) {
 	return c.executor.SessionCache()
 }
 
-// ToolResultData holds the full arguments and output for one tool call, loaded
-// on demand when a frontend expands a collapsed tool card.
+// ToolResultData 持有一次工具调用的完整参数和输出，按需加载——
+// 当前端展开折叠的工具卡片时使用。
 type ToolResultData struct {
-	Args   string `json:"args"`
-	Output string `json:"output"`
+	Args   string `json:"args"`   // 工具调用的 JSON 参数
+	Output string `json:"output"` // 工具调用的输出结果
 }
 
 // ToolResult looks up a tool call by its ID in the session history and returns

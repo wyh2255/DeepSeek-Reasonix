@@ -1,3 +1,13 @@
+// acp.go 实现了 ACP (Agent Client Protocol) 代理模式。
+// 该文件使 Reasonix 可以作为 stdio JSON-RPC 服务器运行，供编辑器和其他宿主客户端驱动
+// （通过 initialize、session/new、session/prompt、session/cancel 等 RPC 方法）。
+// 它保持与 v1 版本通过 ACP 集成的众多工具的线路兼容性。
+//
+// 核心职责：
+//   - 解析命令行参数并启动 ACP 服务
+//   - 通过 acpFactory 为每个 ACP 会话构建 control.Controller
+//   - 提供模型选择、努力级别（effort）等配置选项
+//   - 管理 MCP 服务器和子代理（subagent）提供者解析
 package cli
 
 import (
@@ -22,14 +32,12 @@ import (
 	"reasonix/internal/tool/builtin"
 )
 
-// acpCommand runs Reasonix as an Agent Client Protocol agent: a stdio JSON-RPC
-// server that editors and other host clients drive (initialize, session/new,
-// session/prompt, session/cancel). It keeps v2 wire-compatible with the many
-// tools that integrated with v1 over ACP.
+// acpCommand 运行 Reasonix 作为 Agent Client Protocol 代理：一个 stdio JSON-RPC 服务器，
+// 由编辑器和其他宿主客户端驱动（initialize、session/new、session/prompt、session/cancel）。
+// 它保持与 v1 版本通过 ACP 集成的众多工具的线路兼容性。
 //
-// stdin/stdout are the JSON-RPC channel — nothing else may write to stdout, so
-// all diagnostics go to stderr. Each session is assembled by acpFactory, rooted
-// at the cwd the client opens.
+// stdin/stdout 是 JSON-RPC 通道——不允许其他内容写入 stdout，因此所有诊断信息输出到 stderr。
+// 每个会话由 acpFactory 组装，以客户端打开的 cwd 为工作区根目录。
 func acpCommand(args []string, version string) int {
 	fs := flag.NewFlagSet("acp", flag.ContinueOnError)
 	model := fs.String("model", "", "provider name (default: config default_model)")
@@ -49,20 +57,21 @@ func acpCommand(args []string, version string) int {
 	return 0
 }
 
-// acpFactory builds one control.Controller per ACP session by reusing boot.Build
-// with the session cwd as WorkspaceRoot. That keeps ACP aligned with chat,
-// desktop, and serve assembly while still adding the host-supplied MCP servers
-// for this session only.
+// acpFactory 通过复用 boot.Build 为每个 ACP 会话构建一个 control.Controller，
+// 以会话的 cwd 作为 WorkspaceRoot。这保持了 ACP 与 chat、desktop 和 serve 组装方式的一致性，
+// 同时仅为当前会话添加宿主提供的 MCP 服务器。
 type acpFactory struct {
-	model string
+	model string // 用户指定的模型引用，如 "provider/model"
 }
 
+// SessionDir 返回存储会话数据的目录路径。
 func (f *acpFactory) SessionDir() string {
 	return config.SessionDir()
 }
 
-// NewSession assembles the per-session controller. Resources (MCP subprocesses)
-// are released via the controller's Cleanup, run on ctrl.Close().
+// NewSession 为每个 ACP 会话组装控制器。资源（MCP 子进程）通过控制器的 Cleanup 方法释放，
+// 在 ctrl.Close() 时运行。它复用 boot.Build 构建完整的控制器链路，
+// 包括模型提供者、工具集、MCP 服务器等。
 func (f *acpFactory) NewSession(ctx context.Context, p acp.SessionParams) (*control.Controller, error) {
 	root := strings.TrimSpace(p.Cwd)
 	if root == "" {
@@ -85,6 +94,8 @@ func (f *acpFactory) NewSession(ctx context.Context, p acp.SessionParams) (*cont
 	})
 }
 
+// SessionConfigState 返回当前会话的配置状态，包括可用模型列表、当前模型、
+// 努力级别（effort）选项等。供宿主客户端在 UI 中展示配置选项。
 func (f *acpFactory) SessionConfigState(_ context.Context, p acp.SessionConfigStateParams) (acp.SessionConfigState, error) {
 	root := strings.TrimSpace(p.Cwd)
 	if root == "" {
@@ -186,6 +197,8 @@ func (f *acpFactory) SessionConfigState(_ context.Context, p acp.SessionConfigSt
 	}, nil
 }
 
+// acpBuiltinTools 根据配置构建内置工具集，包括 bash 执行、文件搜索等。
+// 参数 cfg 是配置对象，cwd 是工作目录，writeRoots 是允许写入的根目录列表。
 func acpBuiltinTools(cfg *config.Config, cwd string, writeRoots []string) []tool.Tool {
 	bashSpec := sandbox.Spec{Mode: cfg.BashMode(), WriteRoots: writeRoots, Network: cfg.Sandbox.Network}
 	ws := builtin.Workspace{
@@ -199,6 +212,8 @@ func acpBuiltinTools(cfg *config.Config, cwd string, writeRoots []string) []tool
 	return ws.Tools(cfg.Tools.Enabled...)
 }
 
+// acpModelOptions 从配置中提取所有已配置的模型选项，返回供 ACP 会话配置 UI 使用的
+// 选择选项列表和模型信息列表。
 func acpModelOptions(cfg *config.Config) ([]acp.SessionConfigSelectOption, []acp.ModelInfo) {
 	if cfg == nil {
 		return nil, nil
@@ -227,6 +242,7 @@ func acpModelOptions(cfg *config.Config) ([]acp.SessionConfigSelectOption, []acp
 	return options, models
 }
 
+// hasModelOption 检查给定的模型引用是否已存在于选项列表中，避免重复添加。
 func hasModelOption(options []acp.SessionConfigSelectOption, ref string) bool {
 	for _, opt := range options {
 		if opt.Value == ref {
@@ -236,6 +252,7 @@ func hasModelOption(options []acp.SessionConfigSelectOption, ref string) bool {
 	return false
 }
 
+// acpEffortOptions 将努力级别（effort level）字符串列表转换为 ACP 配置选择选项。
 func acpEffortOptions(levels []string) []acp.SessionConfigSelectOption {
 	out := make([]acp.SessionConfigSelectOption, 0, len(levels))
 	for _, level := range levels {
@@ -244,6 +261,7 @@ func acpEffortOptions(levels []string) []acp.SessionConfigSelectOption {
 	return out
 }
 
+// effortOptionName 将努力级别字符串转换为用户友好的显示名称（首字母大写）。
 func effortOptionName(level string) string {
 	if level == "" {
 		return ""
@@ -254,6 +272,7 @@ func effortOptionName(level string) string {
 	return strings.ToUpper(level[:1]) + level[1:]
 }
 
+// firstNonEmpty 返回可变参数中第一个非空字符串，用于模型优先级回退逻辑。
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -263,6 +282,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// cloneStringPtr 深拷贝一个字符串指针，避免共享引用导致的意外修改。
 func cloneStringPtr(p *string) *string {
 	if p == nil {
 		return nil
@@ -271,6 +291,8 @@ func cloneStringPtr(p *string) *string {
 	return &cp
 }
 
+// acpTaskProfileDefaults 从配置中提取任务子代理（task subagent）的默认模型和努力级别。
+// 返回值分别为模型引用和努力级别字符串。
 func acpTaskProfileDefaults(cfg *config.Config) (string, string) {
 	if cfg == nil {
 		return "", ""
@@ -286,6 +308,9 @@ func acpTaskProfileDefaults(cfg *config.Config) (string, string) {
 	return model, effort
 }
 
+// newACPSubagentProviderResolver 创建一个子代理提供者解析器函数。
+// 该解析器根据模型引用和努力级别动态解析并创建提供者实例，
+// 用于 ACP 会话中的子代理任务执行。
 func newACPSubagentProviderResolver(cfg *config.Config, parent *config.ProviderEntry, proxySpec netclient.ProxySpec) func(string, string) (provider.Provider, *provider.Pricing, int, error) {
 	return func(modelRef, effort string) (provider.Provider, *provider.Pricing, int, error) {
 		modelRef = strings.TrimSpace(modelRef)

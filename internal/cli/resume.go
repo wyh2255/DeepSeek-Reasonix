@@ -1,3 +1,5 @@
+// resume.go 实现了 TUI 中的 /resume 子命令，用于列出最近保存的会话并恢复指定会话。
+// 同时提供了会话序号的自动补全数据源和会话摘要生成函数。
 package cli
 
 import (
@@ -9,11 +11,12 @@ import (
 	"reasonix/internal/i18n"
 )
 
+// resumeListCap 限制 /resume 列表中显示的最大会话数量，
+// 确保列表中的 1-based 索引与 /resume <n> 命令和自动补全一致。
 const resumeListCap = 10
 
-// recentSessions returns the newest saved sessions under dir, capped so the
-// 1-based indices the list shows match what /resume <n> and its completion
-// resolve. A missing dir or read error yields an empty list.
+// recentSessions 返回 dir 目录下最新的保存会话列表（已截断到 resumeListCap）。
+// 目录不存在或读取错误时返回空列表。
 func recentSessions(dir string) []agent.SessionInfo {
 	if dir == "" {
 		return nil
@@ -28,10 +31,9 @@ func recentSessions(dir string) []agent.SessionInfo {
 	return sessions
 }
 
-// runResumeCommand handles "/resume": with no argument it lists the most recent
-// saved sessions (newest first, active one marked); "/resume <n>" loads that
-// session into the running controller in place — keeping the current model and
-// replaying the transcript into scrollback.
+// runResumeCommand 处理 "/resume" 命令：无参数时列出最近保存的会话（最新在前，
+// 当前活跃的标记高亮）；"/resume <n>" 将第 n 个会话加载到当前控制器中，
+// 保留当前模型并将对话记录回放到滚动区域。
 func (m *chatTUI) runResumeCommand(input string) {
 	sessions := recentSessions(m.ctrl.SessionDir())
 	if len(sessions) == 0 {
@@ -70,8 +72,8 @@ func (m *chatTUI) runResumeCommand(input string) {
 	m.replayActiveBranch(i18n.M.ResumedTitle)
 }
 
-// showSessions renders the recent-session list with 1-based indices, timestamp,
-// turn count and preview, marking the one currently active.
+// showSessions 将最近会话列表渲染为带 1-based 索引、时间戳、轮次数和预览的文本，
+// 并标记当前活跃的会话。
 func (m *chatTUI) showSessions(sessions []agent.SessionInfo) {
 	active := m.ctrl.SessionPath()
 	var b strings.Builder
@@ -87,10 +89,10 @@ func (m *chatTUI) showSessions(sessions []agent.SessionInfo) {
 	m.notice(strings.TrimRight(b.String(), "\n"))
 }
 
-// resumeArgItems completes the index argument of "/resume <n>": once past the
-// command word it lists recent sessions, inserting the 1-based index and
-// showing timestamp + turn count + preview as the hint. Indices match
-// showSessions because both window through recentSessions.
+// resumeArgItems 为 "/resume <n>" 命令提供索引参数的自动补全。
+// 输入命令词后，列出最近会话的 1-based 索引，
+// 以"时间戳 + 轮次数 + 预览"作为提示信息。索引与 showSessions 一致，
+// 因为两者都通过 recentSessions 获取数据。
 func (m *chatTUI) resumeArgItems(val string) ([]compItem, int, bool) {
 	cmdEnd := strings.IndexAny(val, " \t")
 	if cmdEnd < 0 || val[:cmdEnd] != "/resume" {
@@ -113,10 +115,9 @@ func (m *chatTUI) resumeArgItems(val string) ([]compItem, int, bool) {
 	return out, from, true
 }
 
-// sessionSummary is the "N turns · project · topicTitle/first message" line
-// shared by the /resume list and its argument completion.
-// When a TopicTitle is set (via /rename or desktop), it is shown instead of
-// the raw preview so the user can identify sessions at a glance.
+// sessionSummary 生成会话摘要行（"N turns · topicTitle/first message"），
+// 供 /resume 列表和参数补全共用。当设置了 TopicTitle（通过 /rename 或桌面端）时，
+// 优先显示标题而非原始预览，方便用户快速识别会话。
 func sessionSummary(s agent.SessionInfo) string {
 	preview := s.Preview
 	if s.TopicTitle != "" {

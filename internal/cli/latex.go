@@ -1,3 +1,11 @@
+// latex.go 实现了 LaTeX 数学表达式到 Unicode 字符的转换。
+// 该文件负责：
+//   - 将 LaTeX 数学符号（如 \alpha、\sum、\infty）映射为 Unicode 字符
+//   - 处理上标/下标（^、_）转换为 Unicode 上下标字符
+//   - 渲染分数（\frac）、根号（\sqrt）和重音符号
+//   - 将 \(..\) 和 \[..\] 等替代数学分隔符标准化为 $..$ / $$..$$
+//   - 实现黑板粗体（\mathbb）等数学字体转换
+// 所有符号映射表均为手工维护，无第三方 Go 库依赖。
 package cli
 
 import (
@@ -5,15 +13,15 @@ import (
 	"unicode/utf8"
 )
 
-// latexToUnicode renders a LaTeX math expression as a best-effort Unicode
-// approximation suitable for a terminal: Greek letters, operators/relations,
-// super/subscripts, \frac, \sqrt and accents map to real glyphs; anything it
-// can't represent degrades to a readable plain-text form. There is no Go
-// library for this, so the symbol table below is maintained by hand.
+// latexToUnicode 将 LaTeX 数学表达式转换为 Unicode 字符近似表示。
+// 支持希腊字母、运算符、关系符、上下标、分数、根号和重音符号等；
+// 无法表示的内容会降级为可读的纯文本形式。
 func latexToUnicode(expr string) string {
 	return convertMath([]rune(expr))
 }
 
+// convertMath 是 LaTeX 数学表达式转换的核心递归函数。
+// 逐字符扫描输入，处理反斜杠命令、上标(^)、下标(_)、花括号和其他特殊字符。
 func convertMath(rs []rune) string {
 	var b strings.Builder
 	b.Grow(len(rs))
@@ -114,6 +122,8 @@ func convertCommand(b *strings.Builder, rs []rune, i int) int {
 // readAtom reads the argument of a command or script: a {balanced group}, a
 // \command, or a single rune. Returns the inner text (no surrounding braces)
 // and the index just past it.
+// readAtom 读取命令或脚标的参数：可以是花括号包围的分组、一个 \命令或单个字符。
+// 返回参数的内部文本（不含外层花括号）和消费后的位置索引。
 func readAtom(rs []rune, i int, skipSpaces bool) (string, int) {
 	if skipSpaces {
 		for i < len(rs) && rs[i] == ' ' {
@@ -153,6 +163,7 @@ func readAtom(rs []rune, i int, skipSpaces bool) (string, int) {
 	}
 }
 
+// readBracket 读取方括号 [...] 中的内容，用于 \sqrt[n]{x} 中的可选参数。
 func readBracket(rs []rune, i int) (string, int) {
 	start := i + 1
 	for j := start; j < len(rs); j++ {
@@ -163,10 +174,14 @@ func readBracket(rs []rune, i int) (string, int) {
 	return "", len(rs)
 }
 
+// renderFrac 将分数渲染为 "numerator/denominator" 形式，
+// 多字符的分子或分母会用括号包裹以保持可读性。
 func renderFrac(num, den string) string {
 	return wrapIfCompound(num) + "/" + wrapIfCompound(den)
 }
 
+// renderSqrt 渲染根号表达式，支持二次根号(√)、三次根号(∛)和四次根号(∜)。
+// 多字符的被开方数会用括号包裹。
 func renderSqrt(idx, arg string) string {
 	if utf8.RuneCountInString(arg) > 1 {
 		arg = "(" + arg + ")"
@@ -182,6 +197,7 @@ func renderSqrt(idx, arg string) string {
 	return superscript(idx) + "√" + arg
 }
 
+// wrapIfCompound 当字符串包含多个字符时用括号包裹，用于分数的分子/分母显示。
 func wrapIfCompound(s string) string {
 	if utf8.RuneCountInString(s) > 1 {
 		return "(" + s + ")"
@@ -189,6 +205,7 @@ func wrapIfCompound(s string) string {
 	return s
 }
 
+// applyCombining 在字符串的第一个字符后插入组合用重音符号（如 hat、bar、dot 等）。
 func applyCombining(s string, mark rune) string {
 	rs := []rune(s)
 	if len(rs) == 0 {
@@ -197,6 +214,8 @@ func applyCombining(s string, mark rune) string {
 	return string(rs[0]) + string(mark) + string(rs[1:])
 }
 
+// blackboard 将字符串中的大写字母转换为黑板粗体（如 R → ℝ, N → ℕ），
+// 用于渲染 \mathbb{R} 等数学符号。
 func blackboard(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -209,6 +228,8 @@ func blackboard(s string) string {
 	return b.String()
 }
 
+// superscript 将字符串转换为 Unicode 上标形式。
+// 如果所有字符都有对应的上标映射则直接替换，否则使用 ^ 前缀标记。
 func superscript(s string) string {
 	if t, ok := mapAll(s, superMap); ok {
 		return t
@@ -219,6 +240,8 @@ func superscript(s string) string {
 	return "^(" + s + ")"
 }
 
+// subscript 将字符串转换为 Unicode 下标形式。
+// 如果所有字符都有对应的下标映射则直接替换，否则使用 _ 前缀标记。
 func subscript(s string) string {
 	if t, ok := mapAll(s, subMap); ok {
 		return t
@@ -229,6 +252,8 @@ func subscript(s string) string {
 	return "_(" + s + ")"
 }
 
+// mapAll 尝试将字符串中的所有字符通过给定映射表转换。
+// 只有当所有字符都能映射时才返回成功。
 func mapAll(s string, m map[rune]rune) (string, bool) {
 	if s == "" {
 		return "", true
@@ -244,6 +269,7 @@ func mapAll(s string, m map[rune]rune) (string, bool) {
 	return b.String(), true
 }
 
+// isASCIILetter 判断字符是否为 ASCII 字母（a-z 或 A-Z）。
 func isASCIILetter(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 }
@@ -325,6 +351,8 @@ func normalizeMath(s string) string {
 	return b.String()
 }
 
+// symbols 是 LaTeX 命令名到 Unicode 字符的映射表，
+// 涵盖希腊字母、运算符、关系符、箭头、积分、集合论等常见数学符号。
 var symbols = map[string]string{
 	"alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
 	"varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "ϑ",
@@ -374,12 +402,14 @@ var symbols = map[string]string{
 	"gcd": "gcd", "dim": "dim", "ker": "ker",
 }
 
+// accents 是 LaTeX 重音命令到 Unicode 组合用字符的映射表。
 var accents = map[string]rune{
 	"hat": '̂', "widehat": '̂', "bar": '̄', "overline": '̄',
 	"vec": '⃗', "dot": '̇', "ddot": '̈', "tilde": '̃',
 	"widetilde": '̃', "acute": '́', "grave": '̀', "check": '̌',
 }
 
+// superMap 是普通字符到 Unicode 上标字符的映射表。
 var superMap = map[rune]rune{
 	'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶',
 	'7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽',
@@ -389,6 +419,7 @@ var superMap = map[rune]rune{
 	'v': 'ᵛ', 'w': 'ʷ', 'x': 'ˣ', 'y': 'ʸ', 'z': 'ᶻ',
 }
 
+// subMap 是普通字符到 Unicode 下标字符的映射表。
 var subMap = map[rune]rune{
 	'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆',
 	'7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '=': '₌', '(': '₍',
@@ -397,6 +428,7 @@ var subMap = map[rune]rune{
 	't': 'ₜ', 'u': 'ᵤ', 'v': 'ᵥ', 'x': 'ₓ',
 }
 
+// blackboardCaps 是大写字母到黑板粗体 Unicode 字符的映射表（如 A → 𝔸, R → ℝ）。
 var blackboardCaps = map[rune]rune{
 	'A': '𝔸', 'B': '𝔹', 'C': 'ℂ', 'D': '𝔻', 'E': '𝔼', 'F': '𝔽', 'G': '𝔾',
 	'H': 'ℍ', 'I': '𝕀', 'J': '𝕁', 'K': '𝕂', 'L': '𝕃', 'M': '𝕄', 'N': 'ℕ',

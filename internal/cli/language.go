@@ -1,3 +1,9 @@
+// language.go 实现了 /language 命令，用于查看和切换界面语言。
+// 该文件负责：
+//   - 解析语言参数（auto/en/zh）
+//   - 读取和写入配置文件中的语言设置
+//   - 清理用户级配置中的语言覆盖（当设置为 auto 时）
+//   - 显示当前语言状态和可用选项
 package cli
 
 import (
@@ -10,6 +16,9 @@ import (
 	"reasonix/internal/i18n"
 )
 
+// runLanguageSubcommand 处理 /language 命令的执行。
+// 无参数时显示当前语言设置和可用选项；
+// 带参数时将语言设置保存到配置文件，并清除用户级的语言覆盖。
 func (m *chatTUI) runLanguageSubcommand(input string) {
 	args := tokenizeArgs(input)
 	if len(args) < 2 {
@@ -61,6 +70,8 @@ func (m *chatTUI) runLanguageSubcommand(input string) {
 	m.notice(fmt.Sprintf(i18n.M.LanguageChangedFmt, languageDisplay(lang), resolved))
 }
 
+// clearUserLanguageOverride 清除用户级配置文件中的语言覆盖设置。
+// 当语言被设为 auto 时调用，确保不会残留之前的语言偏好。
 func clearUserLanguageOverride(primaryPath string) error {
 	userPath := config.UserConfigPath()
 	if userPath == "" || sameConfigPath(primaryPath, userPath) {
@@ -82,6 +93,8 @@ func clearUserLanguageOverride(primaryPath string) error {
 	return edit.SaveTo(userPath)
 }
 
+// sameConfigPath 比较两个配置文件路径是否指向同一个文件。
+// 先转换为绝对路径再进行比较，避免相对路径导致的误判。
 func sameConfigPath(a, b string) bool {
 	aa, errA := filepath.Abs(a)
 	bb, errB := filepath.Abs(b)
@@ -94,6 +107,9 @@ func sameConfigPath(a, b string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
 }
 
+// normalizeLanguageArg 将用户输入的语言参数标准化为内部语言代码。
+// 支持 "auto"/"detect"/"default"（返回空字符串表示自动检测）、
+// "en"/"english"、"zh"/"cn"/"chinese"/"中文"。
 func normalizeLanguageArg(s string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "auto", "detect", "default":
@@ -107,6 +123,7 @@ func normalizeLanguageArg(s string) (string, error) {
 	}
 }
 
+// languageDisplay 返回语言代码的显示文本，空字符串显示为 "auto"。
 func languageDisplay(lang string) string {
 	if strings.TrimSpace(lang) == "" {
 		return "auto"
@@ -114,6 +131,8 @@ func languageDisplay(lang string) string {
 	return lang
 }
 
+// describeLanguages 生成语言选项的描述列表，标记当前选中的语言，
+// 并在 auto 模式下显示实际解析出的语言。
 func describeLanguages(current, resolved string) string {
 	items := []struct {
 		tag  string

@@ -1,7 +1,14 @@
-// Package provider defines the model-backend abstraction and a registry mapping
-// a provider "kind" to a factory. Concrete implementations live in subpackages
-// (e.g. provider/openai) and self-register via init(). The core resolves
-// providers by kind from config and never hardcodes a specific model.
+// Package provider 定义了模型后端的抽象层和自注册工厂。
+//
+// 核心设计:
+//   - Provider 接口: 所有模型后端的统一入口，仅暴露 Stream 方法进行流式补全
+//   - 工厂注册模式: 各具体实现（如 provider/openai、provider/anthropic）在 init()
+//     中通过 Register("kind", NewFn) 注册自己，主程序通过 New("kind", cfg) 按名称实例化
+//   - 消息规范化: NormalizeMessages 在发送前修复工具调用与结果的配对关系，
+//     确保满足 OpenAI/Anthropic API 的协议约束
+//
+// 本包同时定义了消息(Message)、工具调用(ToolCall)、流式增量(Chunk)、
+// 使用量(Usage)、定价(Pricing) 等传输无关的核心数据结构。
 package provider
 
 import (
@@ -16,36 +23,38 @@ import (
 	"reasonix/internal/nilutil"
 )
 
-// Role is the role of a message.
+// Role 表示消息在对话中的角色。
 type Role string
 
 const (
-	RoleSystem    Role = "system"
-	RoleUser      Role = "user"
-	RoleAssistant Role = "assistant"
-	RoleTool      Role = "tool"
+	RoleSystem    Role = "system"    // 系统提示词，引导模型行为
+	RoleUser      Role = "user"      // 用户输入
+	RoleAssistant Role = "assistant" // 模型回复（可能包含文本、工具调用）
+	RoleTool      Role = "tool"      // 工具执行结果
 )
 
-// Message is a single conversation message.
+// Message 表示对话中的一条消息。
+//
+// 支持多模态（文本+图片）、思维链推理（thinking）、工具调用等能力。
+// 消息在会话中以 Role 标识身份，在发送到具体提供者前会被 NormalizeMessages 修复。
 type Message struct {
 	Role             Role     `json:"role"`
 	Content          string   `json:"content,omitempty"`
-	Images           []string `json:"images,omitempty"`            // data URLs (data:<mime>;base64,…); embedded only for vision-capable models
-	ReasoningContent string   `json:"reasoning_content,omitempty"` // assistant: thinking-mode chain-of-thought, round-tripped on multi-turn
-	// ReasoningSignature is an opaque, provider-issued proof that ReasoningContent
-	// is genuine model output. Anthropic requires the signed thinking block be
-	// replayed on the next turn when a tool call followed thinking; providers
-	// without signed reasoning (e.g. the openai-compatible ones) leave it empty.
-	// Round-tripped alongside ReasoningContent.
+	Images           []string `json:"images,omitempty"`            // data URL 格式的图片（data:<mime>;base64,...），仅视觉模型使用
+	ReasoningContent string   `json:"reasoning_content,omitempty"` // assistant 消息：思维链内容，多轮对话时需回传以满足 API 约束
+	// ReasoningSignature 是提供者对思维链内容的签名证明，用于验证思维链的合法性。
+	// Anthropic 要求当工具调用紧随思维链之后时，必须回传带签名的 thinking block；
+	// 无签名推理的提供者（如 OpenAI 兼容层）留空此字段。
+	// 与 ReasoningContent 配对在多轮对话中往返传递。
 	ReasoningSignature string     `json:"reasoning_signature,omitempty"`
-	ToolCalls          []ToolCall `json:"tool_calls,omitempty"`   // set by assistant
-	ToolCallID         string     `json:"tool_call_id,omitempty"` // links a tool result to its call
-	Name               string     `json:"name,omitempty"`         // tool message: tool name
+	ToolCalls          []ToolCall `json:"tool_calls,omitempty"`   // assistant 消息：模型请求的工具调用列表
+	ToolCallID         string     `json:"tool_call_id,omitempty"` // tool 消息：关联到对应的工具调用 ID
+	Name               string     `json:"name,omitempty"`         // tool 消息：工具名称
 }
 
-// ParseImageDataURL splits a `data:<media-type>;base64,<payload>` URL into its
-// media type and base64 payload. ok is false for anything that isn't a base64
-// data URL — providers that need the split (Anthropic) skip those silently.
+// ParseImageDataURL 将 data URL（格式为 data:<media-type>;base64,<payload>）拆分为
+// MIME 类型和 base64 编码的图片数据。返回 ok=false 表示不是合法的 base64 data URL。
+// 需要此拆分的提供者（如 Anthropic）会静默跳过非法 URL。
 func ParseImageDataURL(dataURL string) (mediaType, base64Data string, ok bool) {
 	rest, found := strings.CutPrefix(dataURL, "data:")
 	if !found {
@@ -62,73 +71,68 @@ func ParseImageDataURL(dataURL string) (mediaType, base64Data string, ok bool) {
 	return mt, payload, true
 }
 
-// ToolCall is a tool invocation requested by the model. Arguments is raw JSON.
+// ToolCall 表示模型请求的一次工具调用。
+// Arguments 是原始 JSON 字符串（未解析），Diff/Added/Removed 用于文件编辑类工具的变更统计。
 type ToolCall struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-	Diff      string `json:"diff,omitempty"`
-	Added     int    `json:"added,omitempty"`
-	Removed   int    `json:"removed,omitempty"`
+	ID        string `json:"id"`                  // 工具调用的唯一标识，用于关联 tool 消息的 ToolCallID
+	Name      string `json:"name"`                // 工具名称（如 "bash"、"write_file"）
+	Arguments string `json:"arguments"`           // 工具参数的原始 JSON 字符串
+	Diff      string `json:"diff,omitempty"`      // 文件编辑工具的 diff 输出
+	Added     int    `json:"added,omitempty"`     // 文件编辑新增行数
+	Removed   int    `json:"removed,omitempty"`   // 文件编辑删除行数
 }
 
-// ToolSchema is a tool definition exposed to the model. Parameters is JSON Schema.
+// ToolSchema 是暴露给模型的工具定义。Parameters 使用 JSON Schema 格式描述参数结构。
 type ToolSchema struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Parameters  json.RawMessage `json:"parameters"`
+	Name        string          `json:"name"`        // 工具名称
+	Description string          `json:"description"` // 工具功能描述，供模型理解何时调用
+	Parameters  json.RawMessage `json:"parameters"`  // 参数的 JSON Schema 定义
 }
 
-// Request is a single completion request.
+// Request 是一次补全请求，包含对话历史、可用工具、采样参数等。
+// 各提供者在 Stream 方法中将其转换为各自的 wire format。
 type Request struct {
-	Messages    []Message
-	Tools       []ToolSchema
-	Temperature float64
-	MaxTokens   int
+	Messages    []Message     // 对话历史（已由调用方构造，发送前会经 NormalizeMessages 修复）
+	Tools       []ToolSchema  // 暴露给模型的工具定义列表
+	Temperature float64       // 采样温度（0-2），部分模型不支持
+	MaxTokens   int           // 最大输出 token 数，0 表示使用提供者默认值
 }
 
-// interruptedToolResult stands in for a tool result that never landed — an
-// assistant tool_calls turn whose execution was cut short (interrupt, crash) and
-// later resumed. Sending such a turn unanswered trips the OpenAI/DeepSeek 400
-// "An assistant message with 'tool_calls' must be followed by tool messages
-// responding to each 'tool_call_id'".
+// interruptedToolResult 是为未完成的工具调用生成的占位符结果。
+// 当一个携带 tool_calls 的 assistant 消息因中断（如崩溃、用户取消）而未收到对应结果时，
+// 发送未配对的 tool_calls 会导致 OpenAI/DeepSeek 返回 400 错误。
+// 此占位符确保每条 tool_calls 都有对应的 tool 消息，满足 API 协议约束。
 const interruptedToolResult = "[no result: the previous turn was interrupted before this tool call completed]"
 
-// SanitizeToolPairing is the provider-side alias for NormalizeMessages. It repairs
-// a history so it satisfies the tool-call contract the OpenAI-compatible and
-// Anthropic APIs enforce (every assistant tool_calls answered, no orphan tool
-// messages, truncated args closed) right before sending it to the wire — without
-// touching the stored session. Kept as a distinct name so call sites read as
-// "defensive wire prep" rather than "session mutation".
+// SanitizeToolPairing 是 NormalizeMessages 的提供者端别名。
+// 在发送到网络前修复对话历史，使其满足 OpenAI 兼容和 Anthropic API 的工具调用协议约束：
+//   - 每条 assistant tool_calls 都有对应的 tool 结果消息
+//   - 无孤立的 tool 消息
+//   - 截断的参数 JSON 被修复为合法格式
+//
+// 保持独立命名以便调用点语义清晰："防御性 wire 准备" 而非 "会话修改"。
 func SanitizeToolPairing(msgs []Message) []Message { return NormalizeMessages(msgs) }
 
-// NormalizeMessages repairs a conversation history so it satisfies the tool-call
-// contract the OpenAI-compatible and Anthropic APIs enforce: every assistant
-// tool_calls entry must be answered by a following tool message for its id, and a
-// tool message must follow such a call. It backfills a placeholder result for any
-// unanswered call (so the turn stays intact), drops orphan tool messages,
-// backfills empty tool-call names from their results (#4727 — old sessions saved
-// before adde2d3e can carry an empty name), and closes truncated call-argument
-// JSON (DeepSeek 400s on replayed half-streamed args, #3953).
+// NormalizeMessages 修复对话历史使其满足 OpenAI 兼容和 Anthropic API 的工具调用协议。
 //
-// This is the wire-safe entry point for provider requests. Stored session loads
-// use NormalizeSessionMessages so they can share the assistant-turn repairs
-// without deleting standalone tool messages that must round-trip through
-// reasonix --resume.
+// 修复内容包括:
+//   - 为未回答的 tool_calls 补充占位符结果（保持回合完整）
+//   - 删除孤立的 tool 消息（无对应 tool_calls 的结果）
+//   - 从 tool 结果反向填充空的 tool-call 名称（#4727 兼容旧会话）
+//   - 修复截断的工具调用参数 JSON（DeepSeek 会因半流式参数返回 400，#3953）
 //
-// A well-formed history — no unanswered calls, no orphan results, no empty tool-
-// call names, no truncated args — returns the input slice unchanged (same backing
-// array, zero allocation). This keeps the prefix-cache key stable for healthy
-// sessions and makes repeated normalization cheap.
+// 这是提供者请求的 wire-safe 入口。存储的会话加载使用 NormalizeSessionMessages，
+// 共享 assistant 回合修复逻辑但不删除需要通过 reasonix --resume 往返的独立 tool 消息。
+//
+// 对于结构良好的历史（无未回答调用、无孤立结果、无空工具名、无截断参数），
+// 返回原始切片（零分配），保持 prefix-cache 键稳定。
 func NormalizeMessages(msgs []Message) []Message {
 	return normalizeMessages(msgs, true)
 }
 
-// NormalizeSessionMessages applies only repairs that are safe to persist in a
-// saved session. It shares assistant-turn repairs with NormalizeMessages, but
-// preserves existing tool messages instead of dropping or reordering them so
-// Save/LoadSession remains a byte-for-byte conversation round trip for histories
-// that were already on disk.
+// NormalizeSessionMessages 仅应用对持久化会话安全的修复。
+// 与 NormalizeMessages 共享 assistant 回合修复逻辑，但保留现有 tool 消息而非删除，
+// 确保 Save/LoadSession 对已在磁盘上的历史保持字节级往返一致性。
 func NormalizeSessionMessages(msgs []Message) []Message {
 	return normalizeMessages(msgs, false)
 }
@@ -175,9 +179,9 @@ func normalizeMessages(msgs []Message, dropOrphanTools bool) []Message {
 	return out
 }
 
-// tryNormalizeFastPath reports whether msgs needs no repair and, if so, returns
-// it as-is so the caller can skip allocating. Healthy tool-call/tool-result
-// turns pass through unchanged; malformed turns take the slow path.
+// tryNormalizeFastPath 检查消息历史是否无需修复。
+// 如果所有 tool_calls/tool_result 回合都结构良好，直接返回原始切片（零分配）；
+// 结构不良的回合触发慢速路径进行修复。
 func tryNormalizeFastPath(msgs []Message, dropOrphanTools bool) ([]Message, bool) {
 	for i := 0; i < len(msgs); {
 		m := msgs[i]
@@ -226,9 +230,8 @@ func needsToolCallArgRepair(calls []ToolCall) bool {
 	return false
 }
 
-// repairToolCallArgs returns m with any undecodable tool-call Arguments closed
-// into valid JSON (copy-on-write; the caller's history is never mutated). Empty
-// arguments pass through — some gateways send "" for no-arg tools.
+// repairToolCallArgs 修复消息中无法解码的工具调用参数为合法 JSON。
+// 采用写时复制策略，不修改原始历史。空参数原样保留（某些网关对无参工具发送 ""）。
 func repairToolCallArgs(m Message) Message {
 	broken := false
 	for _, tc := range m.ToolCalls {
@@ -252,9 +255,12 @@ func repairToolCallArgs(m Message) Message {
 	return m
 }
 
-// closeTruncatedJSON best-effort completes a JSON document cut off mid-stream
-// (unterminated string, open braces, dangling comma/colon); anything still
-// invalid after closing degrades to "{}".
+// closeTruncatedJSON 尽力补全被截断的 JSON 文档。
+// 处理场景：未闭合的字符串、未关闭的括号、悬挂的逗号/冒号。
+// 补全后仍无效的降级为 "{}"。
+//
+// 典型场景：DeepSeek 在流式传输工具调用参数时可能因连接中断而截断，
+// 回放这些半截参数会导致 API 400 错误。
 func closeTruncatedJSON(s string) string {
 	var stack []byte
 	inStr, esc := false, false
@@ -307,12 +313,13 @@ func closeTruncatedJSON(s string) string {
 	return out
 }
 
-// pairToolResults answers each tool_call with its result, backfilling a
-// placeholder for any unanswered one. Distinct non-empty ids pair by id (so
-// reordered results re-sort to call order); empty or duplicate ids pair by
-// position instead — some gateways stream tool calls by index with no id, and a
-// map keyed on id would collapse those results into one (call order is preserved
-// because the loop appends results in call order).
+// pairToolResults 为每个 tool_call 配对对应的结果，未回答的调用填充占位符。
+//
+// 配对策略：
+//   - ID 唯一且非空时：按 ID 配对（结果可重排以匹配调用顺序）
+//   - ID 为空或重复时：按位置配对（某些网关按 index 流式传输工具调用，无 ID）
+//
+// 调用顺序始终被保留（循环按调用顺序追加结果）。
 func pairToolResults(calls []ToolCall, avail []Message) []Message {
 	out := make([]Message, 0, len(calls))
 	if idDistinct(calls) {
@@ -341,10 +348,8 @@ func pairToolResults(calls []ToolCall, avail []Message) []Message {
 	return out
 }
 
-// sessionToolResults preserves every stored tool result and appends placeholders
-// only for calls that have no recorded answer. Load-time normalization must not
-// drop or reorder user history; provider sends can still use pairToolResults for
-// strict wire formatting.
+// sessionToolResults 保留所有已存储的 tool 结果，仅为无记录结果的调用追加占位符。
+// 加载时的规范化不能丢弃或重排用户历史；提供者发送时仍可使用 pairToolResults 进行严格的 wire 格式化。
 func sessionToolResults(calls []ToolCall, avail []Message) []Message {
 	out := append([]Message(nil), avail...)
 	if idDistinct(calls) {
@@ -366,12 +371,11 @@ func sessionToolResults(calls []ToolCall, avail []Message) []Message {
 	return out
 }
 
-// backfillToolCallNames returns calls with any empty Name filled in from the
-// matching tool result (by id, then by position). Old sessions (#4727) may have
-// saved assistant tool-calls with an empty name; backfilling gives the model
-// useful context during replay. The common case (no empty names) returns the
-// input unchanged without allocating. Unpaired calls keep their empty name,
-// which the wire-format fix (openai.go) handles gracefully.
+// backfillToolCallNames 从匹配的 tool 结果中反向填充空的工具调用名称。
+// 旧会话（#4727）可能保存了空名称的 assistant tool_calls；反向填充为模型重放提供有用上下文。
+//
+// 配对策略：先按 ID 匹配，再按位置匹配。
+// 常见情况（无空名称）直接返回输入，零分配。未配对的调用保留空名称，由 wire 格式修复（openai.go）处理。
 func backfillToolCallNames(calls []ToolCall, results []Message) []ToolCall {
 	missing := false
 	for _, c := range calls {
@@ -410,8 +414,8 @@ func backfillToolCallNames(calls []ToolCall, results []Message) []ToolCall {
 	return out
 }
 
-// idDistinct reports whether every call carries a non-empty id unique within the
-// batch — the condition under which id-keyed pairing is safe.
+// idDistinct 检查调用批次中的每个 tool_call 是否都有非空且唯一的 ID。
+// 只有满足此条件时，按 ID 配对才是安全的。
 func idDistinct(calls []ToolCall) bool {
 	seen := make(map[string]struct{}, len(calls))
 	for _, tc := range calls {
@@ -426,46 +430,49 @@ func idDistinct(calls []ToolCall) bool {
 	return true
 }
 
-// ChunkType identifies the kind of a streamed increment.
+// ChunkType 标识流式增量的类型。
+// Stream 方法通过 channel 发送 Chunk，调用方根据 Type 字段读取对应的数据。
 type ChunkType int
 
 const (
-	ChunkText          ChunkType = iota // text delta
-	ChunkReasoning                      // thinking-mode reasoning delta (before the visible answer)
-	ChunkToolCallStart                  // a tool call has begun (ToolCall: ID+Name; args still streaming)
-	ChunkToolCall                       // one complete tool call
-	ChunkUsage                          // token usage for the completion
-	ChunkDone                           // completion finished normally
-	ChunkError                          // an error occurred
+	ChunkText          ChunkType = iota // 可见文本增量
+	ChunkReasoning                      // 思维链增量（在可见回答之前的推理过程）
+	ChunkToolCallStart                  // 工具调用开始（含 ID+Name，参数仍在流式传输中）
+	ChunkToolCall                       // 完整的工具调用（参数已全部接收）
+	ChunkUsage                          // 本次补全的 token 使用量
+	ChunkDone                           // 补全正常结束
+	ChunkError                          // 发生错误
 )
 
-// Usage reports token accounting for a completion. Cache hit/miss come from
-// either DeepSeek's top-level prompt_cache_{hit,miss}_tokens or the OpenAI/MiMo
-// standard prompt_tokens_details.cached_tokens — the openai provider normalises
-// both shapes into these fields. ReasoningTokens is the thinking-mode subset of
-// CompletionTokens reported by thinking-capable models. FinishReason carries
-// the model's last reported choices[0].finish_reason so the agent can surface
-// abnormal terminations ("length", "content_filter", "repetition_truncation").
+// Usage 报告一次补全的 token 使用量。
+//
+// 缓存命中/未命中数据来自两种格式之一（openai 提供者统一归一化）：
+//   - DeepSeek: 顶层 prompt_cache_hit_tokens / prompt_cache_miss_tokens
+//   - OpenAI/MiMo: 嵌套的 prompt_tokens_details.cached_tokens
+//
+// ReasoningTokens 是思维模式模型报告的推理 token 子集（属于 CompletionTokens）。
+// FinishReason 携带模型最后报告的终止原因，用于 agent 展示异常终止（如 "length"、"content_filter"）。
 type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	CacheHitTokens   int    // prompt tokens served from cache
-	CacheMissTokens  int    // prompt tokens not cached
-	ReasoningTokens  int    // subset of CompletionTokens spent on chain-of-thought
-	FinishReason     string // "stop", "tool_calls", "length", "content_filter", "repetition_truncation", …
+	PromptTokens     int    // 输入 token 总数
+	CompletionTokens int    // 输出 token 总数
+	TotalTokens      int    // 输入+输出 token 总数
+	CacheHitTokens   int    // 命中缓存的输入 token 数
+	CacheMissTokens  int    // 未命中缓存的输入 token 数
+	ReasoningTokens  int    // 推理 token 数（CompletionTokens 的子集）
+	FinishReason     string // 终止原因: "stop"、"tool_calls"、"length"、"content_filter"、"repetition_truncation" 等
 }
 
-// Pricing is a provider's per-1M-token rates, used to estimate spend. Currency
-// is a display symbol or ISO-like code (default "¥"). toml tags let config decode it.
+// Pricing 是提供者的每百万 token 价格，用于估算费用。
+// Currency 是显示符号或 ISO 代码（默认 "¥"）。toml 标签支持从配置文件解码。
 type Pricing struct {
-	CacheHit float64 `toml:"cache_hit"` // per 1M cached prompt tokens
-	Input    float64 `toml:"input"`     // per 1M uncached prompt tokens
-	Output   float64 `toml:"output"`    // per 1M completion tokens
-	Currency string  `toml:"currency"`
+	CacheHit float64 `toml:"cache_hit"` // 每百万缓存命中 token 的价格
+	Input    float64 `toml:"input"`     // 每百万未缓存输入 token 的价格
+	Output   float64 `toml:"output"`    // 每百万输出 token 的价格
+	Currency string  `toml:"currency"`  // 货币符号或代码（如 "¥"、"USD"）
 }
 
-// Cost estimates the spend for a usage record.
+// Cost 根据使用量估算本次补全的费用。
+// 当缓存命中/未命中数据不完整时，从 PromptTokens 推导。
 func (p *Pricing) Cost(u *Usage) float64 {
 	if p == nil || u == nil {
 		return 0
@@ -537,22 +544,21 @@ func isThreeLetterCurrencyCode(value string) bool {
 	return true
 }
 
-// Chunk is a single streamed event. Read the field matching Type.
+// Chunk 是一个流式事件。根据 Type 字段读取对应的数据字段。
 type Chunk struct {
-	Type      ChunkType
-	Text      string    // ChunkText, ChunkReasoning
-	Signature string    // ChunkReasoning: opaque proof for the reasoning (Anthropic thinking signature), when issued
-	ToolCall  *ToolCall // ChunkToolCallStart (ID+Name only), ChunkToolCall (complete)
-	Usage     *Usage    // ChunkUsage
-	Err       error     // ChunkError
+	Type      ChunkType   // 事件类型
+	Text      string      // ChunkText / ChunkReasoning: 文本或推理内容增量
+	Signature string      // ChunkReasoning: 推理签名（Anthropic thinking signature），用于回传验证
+	ToolCall  *ToolCall   // ChunkToolCallStart (仅 ID+Name) / ChunkToolCall (完整调用)
+	Usage     *Usage      // ChunkUsage: token 使用量
+	Err       error       // ChunkError: 错误信息
 }
 
-// StreamInterruptedError marks a recoverable transport cut that happened after
-// the caller had already received model output. Providers must not replay these
-// requests themselves because doing so could duplicate visible text or tool
-// calls; the agent can append a tail recovery prompt instead.
+// StreamInterruptedError 标记在调用方已接收到模型输出后发生的可恢复传输中断。
+// 提供者不能自行重放此类请求（会导致文本或工具调用重复），
+// agent 应通过追加尾部恢复提示来处理。
 type StreamInterruptedError struct {
-	Err error
+	Err error // 底层错误（通常是连接重置）
 }
 
 func (e *StreamInterruptedError) Error() string {
@@ -574,36 +580,38 @@ func IsStreamInterrupted(err error) bool {
 	return errors.As(err, &interrupted)
 }
 
-// Provider is a chat-capable model backend.
+// Provider 是所有聊天模型后端的核心接口。
+//
+// 实现者在 init() 中通过 provider.Register("kind", NewFn) 注册自己，
+// 主程序通过 provider.New("kind", cfg) 按名称实例化。
 type Provider interface {
-	// Name returns the provider instance name, e.g. "deepseek" / "mimo".
+	// Name 返回提供者实例名称（如 "deepseek"、"mimo"、"anthropic"）。
 	Name() string
-	// Stream starts a streaming completion, pushing increments on the channel.
-	// Cancelling ctx must abort the underlying request; a closed channel marks
-	// the end of the completion.
+	// Stream 启动流式补全，将增量事件推送到返回的 channel。
+	// 取消 ctx 必须中止底层请求；channel 关闭表示补全结束。
+	// 返回的 channel 可能包含: 文本增量、推理增量、工具调用、使用量、完成信号或错误。
 	Stream(ctx context.Context, req Request) (<-chan Chunk, error)
 }
 
-// Config is a resolved provider instance configuration.
+// Config 是已解析的提供者实例配置。
+// 由配置系统从用户配置文件加载并解析环境变量后传入工厂函数。
 type Config struct {
-	Name    string         // instance name, e.g. "deepseek"
-	BaseURL string         // OpenAI-compatible endpoint
-	Model   string         // model id
-	APIKey  string         // resolved from api_key_env
-	Extra   map[string]any // kind-specific options
+	Name    string         // 实例名称（如 "deepseek"、"mimo"）
+	BaseURL string         // API 端点 URL（OpenAI 兼容或 Anthropic 原生）
+	Model   string         // 模型标识符（如 "deepseek-reasoner"、"claude-opus-4-0520"）
+	APIKey  string         // 从 api_key_env 环境变量解析的 API 密钥
+	Extra   map[string]any // 提供者类型特有的选项（如 reasoning_protocol、vision、effort 等）
 }
 
-// AuthError reports that a provider rejected the API key (HTTP 401/403). Its
-// message is already user-facing and actionable — it names the provider and,
-// when known, the environment variable the key comes from — so the CLI can
-// surface it verbatim instead of dumping a raw status body. Providers should
-// return this (rather than a generic status error) for auth failures.
+// AuthError 报告提供者拒绝了 API 密钥（HTTP 401/403）。
+// 错误信息已面向用户且可操作——包含提供者名称和密钥来源的环境变量名，
+// CLI 可直接展示而无需转储原始状态体。
 type AuthError struct {
-	Provider  string // the provider instance name, e.g. "deepseek"
-	KeyEnv    string // the api_key_env the key is read from, when known
-	KeySource string // human-readable source of KeyEnv, when known
-	Status    int    // the HTTP status (401 or 403)
-	HasKey    bool   // a non-empty key was sent — the server rejected it, vs. no key configured at all
+	Provider  string // 提供者实例名称（如 "deepseek"）
+	KeyEnv    string // 密钥来源的环境变量名（如 "DEEPSEEK_API_KEY"）
+	KeySource string // KeyEnv 的人类可读来源描述
+	Status    int    // HTTP 状态码（401 或 403）
+	HasKey    bool   // 是否发送了非空密钥（true=服务器拒绝，false=未配置密钥）
 }
 
 func (e *AuthError) Error() string {
@@ -618,13 +626,14 @@ func (e *AuthError) Error() string {
 		e.Provider, e.Status, key)
 }
 
-// Factory builds a Provider from a resolved Config.
+// Factory 是从已解析的 Config 构建 Provider 的工厂函数。
 type Factory func(cfg Config) (Provider, error)
 
+// registry 存储所有已注册的提供者工厂，key 为提供者类型名称。
 var registry = map[string]Factory{}
 
-// Register adds a factory under a kind (e.g. "openai"). Intended for init().
-// It panics on a duplicate kind, since that is a compile-time wiring mistake.
+// Register 注册一个提供者工厂（如 "openai"、"anthropic"）。
+// 专为 init() 函数使用。重复注册同一类型会 panic，因为这是编译时的接线错误。
 func Register(kind string, f Factory) {
 	if _, dup := registry[kind]; dup {
 		panic("provider: duplicate kind " + kind)
@@ -632,7 +641,8 @@ func Register(kind string, f Factory) {
 	registry[kind] = f
 }
 
-// New instantiates the provider of the given kind.
+// New 按类型名称实例化提供者。
+// 从注册表中查找对应工厂并调用，返回错误表示类型未知或工厂构建失败。
 func New(kind string, cfg Config) (Provider, error) {
 	f, ok := registry[kind]
 	if !ok {
@@ -648,7 +658,8 @@ func New(kind string, cfg Config) (Provider, error) {
 	return p, nil
 }
 
-// Kinds returns the registered kinds, sorted.
+// Kinds 返回所有已注册的提供者类型名称（已排序）。
+// 用于错误提示中列出可用的类型。
 func Kinds() []string {
 	out := make([]string, 0, len(registry))
 	for k := range registry {

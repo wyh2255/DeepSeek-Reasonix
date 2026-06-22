@@ -1,3 +1,12 @@
+// bot.go 实现了 "reasonix bot" 子命令的 CLI 入口，提供多渠道 IM 机器人网关功能。
+// 支持 QQ、飞书（Feishu/Lark）、微信（WeChat）等平台的消息接入。
+// 主要功能包括：
+//   - bot start: 启动机器人网关，连接各 IM 平台并处理消息
+//   - bot doctor: 诊断机器人配置和环境变量是否正确
+//   - bot weixin-login: 微信 iLink 二维码登录流程
+//
+// 所有密钥均通过环境变量读取，不存储在配置文件中。
+
 package cli
 
 import (
@@ -17,6 +26,9 @@ import (
 	"reasonix/internal/config"
 )
 
+// botCommand 是 "reasonix bot" 的顶层子命令分发器。
+// 根据第一个参数（start/doctor/weixin-login/help）分发到对应的处理函数。
+// 返回值为进程退出码：0 表示成功，1 表示运行错误，2 表示参数错误。
 func botCommand(args []string, version string) int {
 	if len(args) < 1 {
 		botUsage()
@@ -43,6 +55,13 @@ func botCommand(args []string, version string) int {
 	}
 }
 
+// botStart 处理 "reasonix bot start" 命令，启动多渠道 IM 机器人网关。
+// 支持的标志参数：
+//   - --channels: 逗号分隔的平台列表（qq,feishu,lark,weixin）
+//   - --dir: 工作目录路径
+//   - --model: 模型名称（为空则使用配置中的默认模型）
+//
+// 启动流程包括：加载配置 -> 校验白名单 -> 构建网关配置 -> 注册信号处理 -> 启动网关。
 func botStart(args []string, version string) int {
 	fs := flag.NewFlagSet("bot start", flag.ContinueOnError)
 	channels := fs.String("channels", "", "启用的平台，逗号分隔：qq,feishu,lark,weixin")
@@ -91,6 +110,7 @@ func botStart(args []string, version string) int {
 	modelName := botruntime.ModelName(cfg, *model)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// 创建远程消息记忆器，用于记录入站消息
 	rememberInboundRemote := botruntime.NewRemoteRememberer(logger)
 
 	// 构建网关配置
@@ -124,7 +144,7 @@ func botStart(args []string, version string) int {
 	feishuDomains := botruntime.RequestedFeishuDomains(requestedChannels)
 	gw := bot.NewGatewayWithAdapterBindings(gwCfg, botruntime.AdapterBindings(cfg, enabledPlatforms, feishuDomains, logger), logger)
 
-	// 信号处理
+	// 注册系统信号处理，收到 SIGINT/SIGTERM 时优雅关闭网关
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -148,6 +168,8 @@ func botStart(args []string, version string) int {
 	return 0
 }
 
+// splitBotChannels 将逗号分隔的渠道字符串拆分为切片。
+// 例如 "qq,feishu" -> ["qq", "feishu"]。
 func splitBotChannels(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -156,6 +178,10 @@ func splitBotChannels(raw string) []string {
 	return strings.Split(raw, ",")
 }
 
+// botDoctor 处理 "reasonix bot doctor" 命令，对机器人配置进行全面诊断。
+// 检查项目包括：bot 启用状态、各平台（QQ/飞书/微信）的配置完整性、
+// 环境变量是否设置、连接配置、白名单配置等。
+// 支持 --json 标志以 JSON 格式输出诊断结果。
 func botDoctor(args []string) int {
 	fs := flag.NewFlagSet("bot doctor", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "JSON 格式输出")
@@ -309,6 +335,9 @@ func botDoctor(args []string) int {
 	return 0
 }
 
+// botWeixinLogin 处理 "reasonix bot weixin-login" 命令，执行微信 iLink 二维码登录。
+// 登录成功后凭据会保存到 Reasonix 用户配置目录。
+// 支持 --timeout 标志设置登录超时时间（默认 480 秒）。
 func botWeixinLogin(args []string) int {
 	fs := flag.NewFlagSet("bot weixin-login", flag.ContinueOnError)
 	timeoutSeconds := fs.Int("timeout", 480, "登录超时时间（秒）")
@@ -340,6 +369,9 @@ func botWeixinLogin(args []string) int {
 	return 0
 }
 
+// loadBotCommandConfig 加载机器人命令所需的配置。
+// 先加载全局配置，然后检查用户级配置文件。
+// 如果用户配置中包含机器人相关设置，则合并覆盖全局配置。
 func loadBotCommandConfig() (*config.Config, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -359,6 +391,9 @@ func loadBotCommandConfig() (*config.Config, error) {
 	return cfg, nil
 }
 
+// botConfigIsUserOwned 判断机器人配置是否包含用户自定义的设置。
+// 当配置中启用了 bot、配置了连接、启用了任何平台、或设置了白名单时返回 true。
+// 用于决定是否用用户配置覆盖全局配置。
 func botConfigIsUserOwned(bc config.BotConfig) bool {
 	if bc.Enabled || len(bc.Connections) > 0 || bc.QQ.Enabled || bc.Feishu.Enabled || bc.Weixin.Enabled {
 		return true
@@ -369,6 +404,7 @@ func botConfigIsUserOwned(bc config.BotConfig) bool {
 	return len(bc.Allowlist.QQGroups)+len(bc.Allowlist.FeishuGroups)+len(bc.Allowlist.WeixinGroups) > 0
 }
 
+// botUsage 打印 "reasonix bot" 命令的使用帮助信息，包括子命令说明和配置指引。
 func botUsage() {
 	fmt.Print(`reasonix bot — multi-channel IM bot gateway (QQ / Feishu / WeChat)
 

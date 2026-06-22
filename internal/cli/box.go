@@ -1,3 +1,7 @@
+// box.go 提供终端文本宽度计算和圆角边框绘制的工具函数。
+// 使用 charmbracelet/x/ansi 库处理 ANSI 转义序列和 CJK 宽字符。
+// 主要用于 CLI 界面中绘制美化的内容边框（如问题卡片、提示框等）。
+
 package cli
 
 import (
@@ -30,6 +34,10 @@ func padRight(s string, w int) string {
 // boxed wraps content in a rounded box drawn with the brand accent. Width
 // auto-fits the longest line plus one column of padding on each side. The
 // result always ends with a trailing newline so callers can Print it directly.
+// boxed 将多行文本包裹在圆角边框中，使用品牌强调色绘制边框。
+// 宽度自动适配最长行加上两侧各一个字符的内边距。
+// 返回的字符串末尾始终带有换行符，调用方可直接打印。
+// 使用 Unicode 制表符（╭╮╰╯─│）绘制圆角边框。
 func boxed(lines []string) string {
 	inner := 0
 	for _, l := range lines {

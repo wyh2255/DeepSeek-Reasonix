@@ -11,12 +11,18 @@ import (
 
 func init() { tool.RegisterBuiltin(editFile{}) }
 
-// editFile replaces an exact string in a file. roots confines the target to the
-// workspace when non-empty (see writeFile); workDir, when non-empty, is the
-// directory a relative path resolves against (see resolveIn).
+// editFile 实现了 edit_file 工具，在文件中精确替换一个字符串。
+//
+// 特性：
+//   - old_string 必须在文件中恰好出现一次（唯一性保证）
+//   - 保留原文件编码
+//   - 自动适配行尾风格（CRLF/LF）
+//   - 支持工作区边界限制
+//
+// roots 非空时限制编辑目标在工作区内；workDir 用于解析相对路径。
 type editFile struct {
-	roots   []string
-	workDir string
+	roots   []string // 可写入的根目录列表
+	workDir string   // 相对路径解析基准目录
 }
 
 func (editFile) Name() string { return "edit_file" }

@@ -1,6 +1,18 @@
-// Package cli implements reasonix's command-line entry: subcommand routing, flag
-// parsing, assembly from config, and exit codes. The core is config-driven —
-// providers and tools are resolved from configuration, not hardcoded.
+// Package cli 实现了 Reasonix 的命令行入口层，包括：
+//   - 子命令路由（run、chat、setup、config、serve、mcp 等）
+//   - 命令行标志（flag）解析
+//   - 从配置文件组装控制器（Controller）
+//   - 进程退出码管理
+//
+// 核心设计原则：配置驱动——模型提供者和工具均从配置中解析，
+// 而非硬编码在代码中。这使得用户可以通过 reasonix.toml 灵活定制行为。
+//
+// 交互模式：
+//   - reasonix          → 启动交互式聊天 TUI（Bubble Tea）
+//   - reasonix run      → 非交互式执行单次提示（适合脚本/管道）
+//   - reasonix serve    → 启动 HTTP+SSE 服务器，将事件流暴露给浏览器
+//   - reasonix setup    → 配置向导
+//   - reasonix config   → 子命令配置管理（auto-plan、reasoning-language）
 package cli
 
 import (
@@ -37,44 +49,81 @@ import (
 	"golang.org/x/term"
 )
 
-var (
-	runInteractiveSession = chatREPL
-	cliIsInteractive      = isInteractive
-)
+// runInteractiveSession 是交互式会话的函数变量，默认指向 chatREPL。
+// 使用变量而非直接调用，便于测试时注入 mock 实现。
+var runInteractiveSession = chatREPL
 
-// Run is the CLI entry point; it returns a process exit code.
+// cliIsInteractive 是交互检测的函数变量，默认指向 isInteractive。
+// 同样用于支持测试时的行为替换。
+var cliIsInteractive = isInteractive
+
+// Run 是 CLI 的主入口函数，返回进程退出码。
+//
+// 参数：
+//   - args: 命令行参数（不含程序名），例如 ["run", "--model", "deepseek", "hello"]
+//   - version: 构建时注入的版本号字符串
+//
+// 返回值：进程退出码（0=成功, 1=运行时错误, 2=用法/参数错误）
+//
+// 执行流程：
+//  1. 检测 UI 语言（先从环境变量，再从配置文件）
+//  2. 提取子命令名称（第一个非标志参数）
+//  3. 执行必要的配置迁移（旧版 → 新版格式）
+//  4. 根据子命令分发到对应的处理函数
+//
+// 子命令列表：
+//   - run: 非交互式执行单次提示
+//   - chat/code: 启动交互式聊天 TUI
+//   - serve: 启动 HTTP+SSE 服务器
+//   - setup: 配置向导
+//   - config: 配置子命令管理
+//   - init: 项目记忆初始化提示
+//   - acp/mcp: Agent Communication Protocol / Model Context Protocol 管理
+//   - doctor: 诊断工具
+//   - review: 代码审查
+//   - bot: 多渠道 IM 机器人
+//   - upgrade/update: 版本升级
+//   - version/help: 版本/帮助信息
 func Run(args []string, version string) int {
-	// Pick the UI language up front so even pre-config paths (the first-run
-	// welcome banner) come through localized. Env-only first; if a config
-	// exists and pins a language, that wins.
+	// 预先检测 UI 语言，确保即使是配置加载前的路径（如首次运行欢迎横幅）
+	// 也能正确显示本地化文本。先用环境变量检测；如果配置文件存在且指定了语言，
+	// 则以配置文件为准。
 	i18n.DetectLanguage("")
 	cmd := ""
 	if len(args) > 0 {
 		cmd = args[0]
 	}
+	// 将 --acp 标志映射为 "acp" 子命令
 	if cmd == "--acp" {
 		cmd = "acp"
 	}
+	// 如果第一个参数是交互模式的标志（如 --model、--continue），
+	// 则视为空子命令，走交互式聊天路径
 	if len(args) > 0 && isDefaultInteractiveFlag(cmd) {
 		cmd = ""
 	}
+	// 对特定子命令执行旧版配置迁移（确保配置格式兼容）
 	if shouldMigrateLegacyConfigForCLI(cmd) {
 		migrateLegacyConfigForCLI()
 	}
+	// 加载配置并应用语言设置（配置中的语言优先于环境变量）
 	if cfg, err := config.Load(); err == nil {
 		if cfg.Language != "" {
 			i18n.DetectLanguage(cfg.Language)
 		}
 	}
 
+	// 无参数且终端交互模式 → 启动交互式聊天 TUI
 	if len(args) == 0 && cliIsInteractive() {
 		return runInteractiveSession(nil)
 	}
+	// 无参数且非交互模式 → 显示用法信息
 	if len(args) == 0 {
 		configureCLIThemeFromConfigForTTYOutput()
 		usage()
 		return 0
 	}
+	// 子命令为空（第一个参数是标志）→ 走交互式聊天路径，传入原始参数
 	if cmd == "" {
 		return runInteractiveSession(args)
 	}
@@ -83,7 +132,7 @@ func Run(args []string, version string) int {
 	switch cmd {
 	case "run":
 		return runAgent(rest)
-	case "chat", "code": // "code" is the v0.x name for the interactive session
+	case "chat", "code": // "code" 是 v0.x 版本中交互式会话的旧名称
 		return runInteractiveSession(rest)
 	case "serve":
 		return runServe(rest)
@@ -94,9 +143,9 @@ func Run(args []string, version string) int {
 		configureCLIThemeFromConfigNoProbe()
 		return configCommand(rest)
 	case "init":
-		// Project memory (AGENTS.md) is model-generated in-session — `/init` runs
-		// the codebase analysis. This CLI entry just points there (and to `setup`
-		// for config), so `reasonix init` isn't a dead end.
+		// 项目记忆（AGENTS.md）由模型在会话中生成——`/init` 技能运行代码库分析。
+		// 此 CLI 入口仅给出提示（同时指向 `setup` 进行配置），
+		// 使 `reasonix init` 不会成为死胡同。
 		configureCLIThemeFromConfigNoProbe()
 		return initHint()
 	case "acp":
@@ -130,6 +179,9 @@ func Run(args []string, version string) int {
 	}
 }
 
+// isDefaultInteractiveFlag 判断参数是否为交互模式的默认标志。
+// 当 reasonix 后面直接跟这些标志时，视为进入交互式聊天模式（而非子命令）。
+// 支持带等号的形式，如 --model=deepseek。
 func isDefaultInteractiveFlag(arg string) bool {
 	switch arg {
 	case "--model", "--max-steps", "--continue", "-c", "--resume", "--dangerously-skip-permissions", "--yolo", "--dir":
@@ -141,6 +193,8 @@ func isDefaultInteractiveFlag(arg string) bool {
 	return false
 }
 
+// shouldMigrateLegacyConfigForCLI 判断给定子命令是否需要执行旧版配置迁移。
+// 主要的会话和配置相关命令都需要迁移，而 help/version 等不需要。
 func shouldMigrateLegacyConfigForCLI(cmd string) bool {
 	switch cmd {
 	case "", "run", "chat", "code", "serve", "setup", "config", "init", "acp", "mcp", "doctor", "bot", "upgrade", "update":
@@ -150,12 +204,17 @@ func shouldMigrateLegacyConfigForCLI(cmd string) bool {
 	}
 }
 
+// migrateLegacyConfigForCLI 执行旧版配置文件的格式迁移。
+// 将 v0.x 或早期版本的配置自动转换为当前版本格式。
+// 迁移失败仅输出警告，不中断程序执行。
 func migrateLegacyConfigForCLI() {
 	if _, err := config.MigrateLegacyIfNeeded(); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: config migration failed:", err)
 	}
 }
 
+// migrateMCPConfigForCLIWorkspace 将项目级 MCP 配置迁移到用户级配置。
+// 确保旧版本中项目目录下的 MCP 服务器配置升级后仍然可用。
 func migrateMCPConfigForCLIWorkspace() {
 	if wd, err := os.Getwd(); err == nil {
 		if _, err := config.MigrateMCPToUserConfigOnUpgrade([]string{wd}); err != nil {
@@ -164,6 +223,8 @@ func migrateMCPConfigForCLIWorkspace() {
 	}
 }
 
+// configureCLIThemeFromConfig 从配置文件加载并应用 CLI 主题设置。
+// 包括主题（auto/dark/light）和主题风格（graphite/aurora/slate 等）。
 func configureCLIThemeFromConfig() {
 	if cfg, err := config.Load(); err == nil {
 		configureCLIThemeWithStyle(cfg.UITheme(), cfg.UIThemeStyle())
@@ -172,6 +233,9 @@ func configureCLIThemeFromConfig() {
 	}
 }
 
+// configureCLIThemeFromConfigForTTYOutput 在 TTY 输出时从配置加载主题。
+// 如果 stdout 是终端则完整加载主题（包括终端探测），否则跳过探测。
+// 这避免了在管道/重定向输出时进行不必要的终端能力检测。
 func configureCLIThemeFromConfigForTTYOutput() {
 	if isTTY(os.Stdout) {
 		configureCLIThemeFromConfig()
@@ -180,18 +244,27 @@ func configureCLIThemeFromConfigForTTYOutput() {
 	configureCLIThemeFromConfigNoProbe()
 }
 
+// configureCLIThemeFromConfigNoProbe 从配置加载主题但不执行终端探测。
+// 用于非交互式子命令（如 config、doctor），避免干扰已有的终端状态。
 func configureCLIThemeFromConfigNoProbe() {
 	withoutTerminalProbe(configureCLIThemeFromConfig)
 }
 
-// setup builds a ready-to-drive Controller from config via boot.Build. It is a
-// thin adapter kept so the subcommands below read the same as before; the actual
-// assembly (model resolution, tool registry, permission gate, two-model
-// Coordinator) lives in internal/boot, shared with the desktop frontend.
-// requireKey forces the executor's API key to be present (used by run); chat
-// passes false so the session UI is reachable before a key is set. sink receives
-// the agent's typed event stream — runAgent passes a TextSink that renders to
-// stdout, the TUI passes an event-channel sink so events become tea.Msgs.
+// setup 通过 boot.Build 从配置组装一个可用的 Controller。
+// 这是一个薄适配层，实际的组装逻辑（模型解析、工具注册、权限门控、
+// 双模型协调器）位于 internal/boot 包中，与桌面前端共享。
+//
+// 参数：
+//   - ctx: 上下文，用于取消和超时控制
+//   - modelName: 模型引用（如 "deepseek" 或 "deepseek/deepseek-v4-flash"），空字符串使用配置默认值
+//   - maxStepsOverride: 工具调用轮次上限覆盖，0 表示使用配置值
+//   - requireKey: 是否强制要求 API 密钥存在（run 命令为 true，chat 为 false 以便无密钥也能打开 UI）
+//   - sink: 事件接收器，接收智能体的类型化事件流。runAgent 传入 TextSink 渲染到 stdout，
+//     TUI 传入 event-channel sink 将事件转为 tea.Msg
+//
+// 返回值：
+//   - *control.Controller: 可驱动的控制器实例
+//   - error: 组装失败时返回错误（如模型未配置、API 密钥缺失等）
 func setup(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink) (*control.Controller, error) {
 	migrateMCPConfigForCLIWorkspace()
 	return boot.Build(ctx, boot.Options{
@@ -203,9 +276,11 @@ func setup(ctx context.Context, modelName string, maxStepsOverride int, requireK
 	})
 }
 
-// resolveCLISessionDir returns the session dir for CLI invocations. When the
-// current working directory maps to a project session dir, the project dir is
-// used so /resume shows project history. Falls back to the global session dir.
+// resolveCLISessionDir 返回 CLI 调用的会话目录。
+// 当当前工作目录映射到项目会话目录时，使用项目目录以便 /resume 显示项目历史。
+// 否则回退到全局会话目录。
+//
+// 返回值：会话目录的绝对路径
 func resolveCLISessionDir() string {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -217,9 +292,12 @@ func resolveCLISessionDir() string {
 	return config.SessionDir()
 }
 
-// setupQuiet is like setup but suppresses plugin subprocess stderr output.
-// Used during model switch inside a bubbletea session to prevent plugin logs
-// from corrupting the TUI's terminal raw mode.
+// setupQuiet 与 setup 类似，但抑制插件子进程的 stderr 输出。
+// 用于 Bubble Tea 会话中的模型切换，防止插件日志破坏 TUI 的终端原始模式。
+//
+// 参数：同 setup 函数
+//
+// 返回值：同 setup 函数
 func setupQuiet(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink) (*control.Controller, error) {
 	return boot.Build(ctx, boot.Options{
 		Model:      modelName,
@@ -230,9 +308,13 @@ func setupQuiet(ctx context.Context, modelName string, maxStepsOverride int, req
 	})
 }
 
-// chdirTo honours --dir: it switches the working directory before anything reads
-// it, so config discovery, the sandbox root, and file tools all resolve from the
-// chosen project root. Returns 2 (already reported) on failure, 0 otherwise.
+// chdirTo 处理 --dir 标志：在任何读取操作之前切换工作目录，
+// 使配置发现、沙箱根目录和文件工具都从选定的项目根目录解析。
+//
+// 参数：
+//   - dir: 目标目录路径，空字符串表示不切换
+//
+// 返回值：0=成功, 2=失败（已输出错误信息）
 func chdirTo(dir string) int {
 	if dir == "" {
 		return 0
@@ -244,6 +326,16 @@ func chdirTo(dir string) int {
 	return 0
 }
 
+// modelForResumePath 在恢复会话时确定应使用的模型。
+// 如果用户显式指定了模型（modelName 非空），则使用用户指定的模型。
+// 否则从会话文件中读取上次使用的模型，并验证其在当前配置中是否可用。
+//
+// 参数：
+//   - modelName: 用户通过 --model 指定的模型名，空字符串表示未指定
+//   - resumePath: 要恢复的会话文件路径
+//   - cfg: 当前配置（用于验证模型是否可用），可为 nil
+//
+// 返回值：最终应使用的模型引用字符串
 func modelForResumePath(modelName, resumePath string, cfg *config.Config) string {
 	if strings.TrimSpace(modelName) != "" || strings.TrimSpace(resumePath) == "" {
 		return modelName
@@ -261,6 +353,15 @@ func modelForResumePath(modelName, resumePath string, cfg *config.Config) string
 	return sessionModel
 }
 
+// loadResumableSession 加载可恢复的会话文件。
+// 如果会话有待处理的清理操作（如中断的写入），则拒绝加载以避免数据损坏。
+//
+// 参数：
+//   - path: 会话文件路径
+//
+// 返回值：
+//   - *agent.Session: 加载的会话数据
+//   - error: 加载失败时返回错误（如文件不存在、有待处理清理等）
 func loadResumableSession(path string) (*agent.Session, error) {
 	if agent.IsCleanupPending(path) {
 		return nil, fmt.Errorf("session is pending cleanup")
@@ -268,9 +369,18 @@ func loadResumableSession(path string) (*agent.Session, error) {
 	return agent.LoadSession(path)
 }
 
+// newNotificationSender 是创建平台通知发送器的工厂函数。
+// 使用变量便于测试时注入 mock 实现。
 var newNotificationSender = func() notify.Sender { return notify.NewPlatformSender() }
 
-// withNotifications adds system notifications to CLI event streams when configured.
+// withNotifications 在配置启用时为 CLI 事件流添加系统通知。
+// 当 cfg.Notifications.Enabled 为 true 时，包装原始 sink 以发送桌面通知。
+//
+// 参数：
+//   - sink: 原始事件接收器
+//   - cfg: 配置对象（读取通知设置）
+//
+// 返回值：添加了通知能力的事件接收器
 func withNotifications(sink event.Sink, cfg *config.Config) event.Sink {
 	if cfg == nil || !cfg.Notifications.Enabled {
 		return sink
@@ -278,6 +388,22 @@ func withNotifications(sink event.Sink, cfg *config.Config) event.Sink {
 	return notify.NewSink(sink, newNotificationSender(), cfg.Notifications)
 }
 
+// runAgent 实现 `reasonix run` 子命令：非交互式执行单次提示。
+//
+// 支持的标志：
+//   - --model: 指定模型提供者
+//   - --max-steps: 工具调用轮次上限（0=使用配置值）
+//   - --show-thinking: 显示思考文本（默认折叠）
+//   - --metrics: 将 token/缓存/成本摘要写入 JSON 文件
+//   - --dir: 切换工作目录后再执行
+//   - --continue/-c: 恢复最近的保存会话
+//   - --resume: 恢复指定的会话文件
+//
+// 提示来源（优先级从高到低）：
+//  1. 命令行剩余参数
+//  2. stdin 管道输入
+//
+// 返回值：进程退出码（0=成功, 1=运行时错误, 2=参数错误）
 func runAgent(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	model := fs.String("model", "", "provider name (default: config default_model)")
@@ -392,10 +518,20 @@ func runAgent(args []string) int {
 	return 0
 }
 
-// runServe exposes the controller over HTTP+SSE: events stream to the browser,
-// commands arrive as JSON POSTs. The Broadcaster is the controller's event sink,
-// so the same typed stream the chat TUI consumes reaches web clients — the
-// transport-agnostic controller driven by a second frontend.
+// runServe 实现 `reasonix serve` 子命令：通过 HTTP+SSE 暴露控制器。
+//
+// 事件流通过 Server-Sent Events 推送到浏览器，命令通过 JSON POST 接收。
+// Broadcaster 作为控制器的事件接收器，使同一类型化事件流
+// （聊天 TUI 消费的同一个流）也到达 Web 客户端——
+// 这是一个传输层无关的控制器，由第二个前端驱动。
+//
+// 支持的标志：
+//   - --model: 指定模型提供者
+//   - --max-steps: 工具调用轮次上限
+//   - --addr: 监听地址（默认 127.0.0.1:8787）
+//   - --resume: 恢复指定的会话文件
+//
+// 返回值：进程退出码
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	model := fs.String("model", "", "provider name (default: config default_model)")
@@ -444,9 +580,20 @@ func runServe(args []string) int {
 	return 0
 }
 
-// chatREPL is an interactive session: a single persistent agent/session and a
-// prompt loop that keeps conversation context across turns. Exit with
-// 'exit'/'quit' or Ctrl-D.
+// chatREPL 实现交互式聊天会话：一个持久的智能体/会话和提示循环，
+// 跨轮次保持对话上下文。使用 Bubble Tea TUI 框架渲染界面。
+//
+// 退出方式：输入 'exit'/'quit' 或按 Ctrl-D。
+//
+// 支持的标志：
+//   - --model: 指定模型提供者
+//   - --max-steps: 工具调用轮次上限
+//   - --continue/-c: 恢复最近的保存会话
+//   - --resume: 交互式选择要恢复的会话
+//   - --dangerously-skip-permissions/--yolo: 自动批准所有工具调用（跳过权限检查）
+//   - --dir: 切换工作目录
+//
+// 返回值：进程退出码
 func chatREPL(args []string) int {
 	fs := flag.NewFlagSet("reasonix", flag.ContinueOnError)
 	model := fs.String("model", "", "provider name (default: config default_model)")
@@ -645,6 +792,8 @@ func chatREPL(args []string) int {
 	return 0
 }
 
+// prepareNativeScrollback 为 Termux 等使用原生滚动缓冲区的终端准备环境。
+// 清除终端的滚动历史，使重新打开的聊天从干净状态开始。
 func prepareNativeScrollback(w io.Writer, rows int) {
 	// Clear the terminal's scrollback history so a reopened chat starts
 	// with a clean slate (Termux stays in the normal buffer, so prior
@@ -653,23 +802,25 @@ func prepareNativeScrollback(w io.Writer, rows int) {
 	reserveNativeScrollbackFrame(w, rows)
 }
 
+// reserveNativeScrollbackFrame 在终端中预留指定行数的滚动帧空间。
+// 用于 Termux 环境，确保软键盘弹出时内容不被遮挡。
 func reserveNativeScrollbackFrame(w io.Writer, rows int) {
 	for i := 0; i < rows; i++ {
 		fmt.Fprintln(w)
 	}
 }
 
-// setupTargets is where the wizard writes: the TOML config and the credential
-// store. Keys always go to the reasonix-owned global credential store so they
-// never land in a project's own .env; only the config location is project-local
-// under --local.
+// setupTargets 定义配置向导的写入目标：TOML 配置文件和凭证存储。
+// API 密钥始终写入 reasonix 全局凭证存储，绝不写入项目自身的 .env 文件。
+// 只有配置文件位置在 --local 模式下才是项目本地的。
 type setupTargets struct {
 	config string
 	env    string
 }
 
-// defaultConfigTarget is the user-global config file, falling back to a
-// project-local reasonix.toml only when the user config dir can't be resolved.
+// defaultConfigTarget 返回默认配置文件路径。
+// 优先使用用户全局配置文件（~/.reasonix/config.toml），
+// 仅在无法解析用户配置目录时回退到项目本地 reasonix.toml。
 func defaultConfigTarget() string {
 	if p := config.UserConfigPath(); p != "" {
 		return p
@@ -677,15 +828,22 @@ func defaultConfigTarget() string {
 	return "reasonix.toml"
 }
 
-// defaultEnvTarget is the display target for the reasonix-owned global
-// credential store.
+// defaultEnvTarget 返回 reasonix 全局凭证存储的显示路径。
+// 用于向导输出，告知用户 API 密钥将存储在何处。
 func defaultEnvTarget() string {
 	return config.CredentialsTargetDescription()
 }
 
-// resolveSetupTargets picks where `reasonix setup` writes. Keys always go to the
-// global env. The config goes to the user-global dir by default, to ./reasonix.toml
-// under --local, or to an explicit path argument when given.
+// resolveSetupTargets 确定 `reasonix setup` 的写入位置。
+// API 密钥始终写入全局凭证存储。配置文件的写入位置取决于参数：
+//   - 默认：用户全局配置目录
+//   - --local/-l：项目本地 ./reasonix.toml
+//   - 显式路径参数：指定的路径
+//
+// 参数：
+//   - args: 命令行参数（不含 "setup" 子命令）
+//
+// 返回值：配置向导的写入目标
 func resolveSetupTargets(args []string) setupTargets {
 	t := setupTargets{config: defaultConfigTarget(), env: defaultEnvTarget()}
 	for _, a := range args {
@@ -699,7 +857,8 @@ func resolveSetupTargets(args []string) setupTargets {
 	return t
 }
 
-// displayPath shortens a home-relative path to ~/… for readable wizard output.
+// displayPath 将路径缩短为相对于主目录的 ~/... 形式，使向导输出更易读。
+// 例如 "/home/user/.reasonix/config.toml" → "~/.reasonix/config.toml"
 func displayPath(p string) string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(p, home) {
 		return "~" + p[len(home):]
@@ -707,12 +866,21 @@ func displayPath(p string) string {
 	return p
 }
 
-// setupConfig runs the configuration wizard (the `reasonix setup` command),
-// writing config.toml to the user-global dir (or ./reasonix.toml under --local)
-// and API keys to the reasonix-owned global credential store — never a project's
-// own .env.
-// Project memory is a separate concern — the in-session `/init` skill generates
-// AGENTS.md (see initHint).
+// setupConfig 实现 `reasonix setup` 子命令：运行配置向导。
+//
+// 写入目标：
+//   - 配置文件：用户全局目录（默认）或 ./reasonix.toml（--local 模式）
+//   - API 密钥：reasonix 全局凭证存储（绝不写入项目 .env）
+//
+// 向导流程：
+//  1. 检查是否已有配置文件（非交互模式下拒绝覆盖）
+//  2. 交互模式下确认是否重新配置
+//  3. 运行交互式向导或写入默认配置
+//
+// 参数：
+//   - args: 命令行参数（如 ["--local"]）
+//
+// 返回值：进程退出码
 func setupConfig(args []string) int {
 	t := resolveSetupTargets(args)
 	path := t.config
@@ -740,11 +908,20 @@ func setupConfig(args []string) int {
 	return writeDefaultConfig(t.config)
 }
 
+// confirmReconfigureExistingConfig 在配置文件已存在时询问用户是否重新配置。
+// 返回 true 表示用户确认重新配置，false 表示保留现有配置。
 func confirmReconfigureExistingConfig(path string, in *bufio.Scanner, w io.Writer) bool {
 	ans := ask(in, w, fmt.Sprintf(i18n.M.ConfirmReconfigureFmt, path), "y/N")
 	return ans == "y" || ans == "Y"
 }
 
+// writeDefaultConfig 写入默认配置文件。
+// 用于非交互模式（管道/脚本），直接写入内置默认配置。
+//
+// 参数：
+//   - path: 配置文件写入路径
+//
+// 返回值：进程退出码
 func writeDefaultConfig(path string) int {
 	c := config.Default()
 	if err := c.SaveTo(path); err != nil {
@@ -756,22 +933,31 @@ func writeDefaultConfig(path string) int {
 	return 0
 }
 
-// initHint handles `reasonix init`. Unlike a config scaffold, project memory is
-// model-generated by analyzing the codebase, so it lives as the in-session
-// `/init` skill rather than a CLI command. This entry just points the user there
-// (and to `reasonix setup` for config) so the verb isn't a dead end.
+// initHint 处理 `reasonix init` 命令。
+// 与配置脚手架不同，项目记忆（AGENTS.md）由模型在会话中通过分析代码库生成，
+// 因此它作为会话内的 `/init` 技能存在，而非 CLI 命令。
+// 此入口仅给出提示，引导用户使用正确的方式，使命令不会成为死胡同。
 func initHint() int {
 	fmt.Println(i18n.M.InitHint)
 	return 0
 }
 
-// interactiveSetup runs the setup wizard, then writes the config to configPath
-// and any entered API keys to the configured global credential store. The wizard
-// is intentionally minimal: pick language, pick
-// provider, enter API keys. Language is asked first so every subsequent prompt
-// is already in the user's language even when env auto-detection got it wrong.
-// Two-model collaboration is left as a manual config edit (planner_model) so
-// first-run never confronts newcomers with advanced choices.
+// interactiveSetup 运行交互式配置向导。
+//
+// 向导流程（有意保持简洁）：
+//  1. 选择语言（中文/英文）——先选语言，使后续提示都用用户语言显示
+//  2. 选择启用的模型提供者（DeepSeek / 自定义 / Anthropic 等）
+//  3. 输入 API 密钥
+//  4. 写入配置文件和凭证存储
+//
+// 设计决策：双模型协作（planner_model）留作手动配置编辑，
+// 首次运行不会让新手面对高级选项。
+//
+// 参数：
+//   - configPath: 配置文件写入路径
+//   - envPath: 凭证存储的显示路径（实际写入由 config.StoreCredentialLines 决定）
+//
+// 返回值：进程退出码（0=成功, 1=失败/取消）
 func interactiveSetup(configPath, envPath string) int {
 	// Seed from the existing config when reconfiguring, so a re-run to fix a key
 	// preserves the user's providers / agent settings instead of resetting to
@@ -839,10 +1025,12 @@ func interactiveSetup(configPath, envPath string) int {
 	return 0
 }
 
-// pickSessionToResume scans the session dir, takes the 10 most recent, and
-// shows a single-choice menu with timestamp + turn count + first user
-// message so the user can pick one. Returns the chosen path and a process
-// exit code (non-zero when there's nothing to pick or the user cancelled).
+// pickSessionToResume 扫描会话目录，取最近 10 个会话，
+// 显示单选菜单（包含时间戳、轮次数和首条用户消息）供用户选择。
+//
+// 返回值：
+//   - string: 选中的会话文件路径
+//   - int: 进程退出码（0=成功, 1=无可选会话或用户取消）
 func pickSessionToResume() (string, int) {
 	sessions, err := agent.ListSessions(resolveCLISessionDir())
 	if err != nil || len(sessions) == 0 {
@@ -876,10 +1064,13 @@ func pickSessionToResume() (string, int) {
 	return sessions[idx].Path, 0
 }
 
-// selectLanguage is the wizard's first prompt: it shows the two UI languages
-// in their native form and pre-selects the env-detected one (so a single Enter
-// confirms the auto-detection, a single arrow + Enter picks the other). The
-// label is bilingual because we don't yet know which catalogue to trust.
+// selectLanguage 是向导的第一个提示：以原生形式显示两种 UI 语言，
+// 并预选环境检测到的语言（单按 Enter 确认自动检测，方向键+Enter 选择另一种）。
+// 标签使用双语，因为此时还不确定使用哪个语言目录。
+//
+// 返回值：
+//   - string: 语言标签（"en" 或 "zh"）
+//   - error: 选择失败时返回错误
 func selectLanguage() (string, error) {
 	detected := i18n.DetectLanguage("")
 	items := []menuItem{{name: "English"}, {name: "中文 (简体)"}}
@@ -895,15 +1086,27 @@ func selectLanguage() (string, error) {
 	return tags[idx], nil
 }
 
-// selectEnabledProviders prompts a single multi-select of provider families
-// (DeepSeek / custom / …) and returns one ProviderEntry per chosen
-// family, carrying the models the user picked. Built-in families try the
-// OpenAI-compatible GET /models endpoint first (so the user sees the real
-// list, not a stale hard-coded one) and fall back to the preset's static
-// model list when the call fails — offline first-run, missing key, or a
-// vendor that doesn't expose /models. All paths funnel through the same
-// fetchOrFallback / buildFamilyEntry helpers, so adding a new family only
-// requires a familyOf case.
+// selectEnabledProviders 显示模型提供者家族的多选菜单
+// （DeepSeek / 自定义 / Anthropic 等），返回用户选择的 ProviderEntry 列表。
+//
+// 工作流程：
+//  1. 过滤旧版向导遗留的无效条目
+//  2. 合并内置提供者家族
+//  3. 按家族分组显示多选菜单
+//  4. 对每个选中的家族，尝试 OpenAI 兼容的 GET /models 端点获取实时模型列表
+//  5. 获取失败时（离线、无密钥、不支持 /models）回退到预设的静态模型列表
+//  6. 显示模型多选菜单，构建 ProviderEntry
+//
+// 所有路径都通过 fetchOrFallback / buildFamilyEntry 辅助函数统一处理，
+// 添加新家族只需在 familyOf 中增加一个 case。
+//
+// 参数：
+//   - providers: 当前配置中的提供者列表
+//   - pricingLanguage: 价格语言（影响内置提供者的价格显示）
+//
+// 返回值：
+//   - []config.ProviderEntry: 用户选择启用的提供者列表
+//   - error: 选择失败时返回错误
 func selectEnabledProviders(providers []config.ProviderEntry, pricingLanguage string) ([]config.ProviderEntry, error) {
 	providers, stale := filterStaleCustomEntries(providers)
 	for _, s := range stale {
@@ -994,6 +1197,15 @@ func selectEnabledProviders(providers []config.ProviderEntry, pricingLanguage st
 // preserving order and dropping duplicates. It is the fallback offered when the
 // live /models probe fails, so a family with separate flash/pro preset entries
 // still surfaces both rather than only the first member's model.
+//
+// familyStaticModels 合并家族中所有成员的预设模型列表，保持顺序并去重。
+// 当实时 /models 探测失败时，此列表作为回退方案提供给用户选择。
+//
+// 参数：
+//   - providers: 完整的提供者列表
+//   - idxs: 家族成员在 providers 中的索引
+//
+// 返回值：去重后的模型名称列表
 func familyStaticModels(providers []config.ProviderEntry, idxs []int) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -1008,11 +1220,15 @@ func familyStaticModels(providers []config.ProviderEntry, idxs []int) []string {
 	return out
 }
 
-// ensureProbeKey prompts once for the family's API key when it isn't already in
-// the environment, so the /models probe can run and return the live SKU list.
-// The value is set in the env for the probe; configureKeys returns the same key
-// for the credential store later and skips re-asking. A blank entry is fine —
-// the static fallback covers it.
+// ensureProbeKey 在家族的 API 密钥未设置时提示用户输入一次，
+// 使 /models 探测能够运行并返回实时的 SKU 列表。
+// 输入的值直接设置到环境变量中供探测使用；
+// 后续 configureKeys 会看到环境变量已设置，不会重复询问。
+// 空输入也是允许的——静态回退方案会覆盖这种情况。
+//
+// 参数：
+//   - probe: 提供者条目（读取 APIKeyEnv）
+//   - famName: 家族名称（用于提示显示）
 func ensureProbeKey(probe *config.ProviderEntry, famName string) {
 	if probe.APIKeyEnv == "" || os.Getenv(probe.APIKeyEnv) != "" {
 		return
@@ -1024,12 +1240,18 @@ func ensureProbeKey(probe *config.ProviderEntry, famName string) {
 	}
 }
 
-// fetchOrFallback tries the OpenAI-compatible GET /models endpoint
-// (honoring the entry's ModelsURL when set) and returns the live model IDs.
-// On any failure — no base URL, no key set yet (the key is collected in a
-// later wizard step), network/auth error, or a vendor without /models — it
-// silently returns the preset's static model list so the wizard can always
-// present something. The fetch has a 10s timeout and is best-effort.
+// fetchOrFallback 尝试通过 OpenAI 兼容的 GET /models 端点获取实时模型列表
+// （优先使用条目的 ModelsURL），返回模型 ID 列表。
+//
+// 失败时（无 base URL、密钥未设置、网络/认证错误、供应商不支持 /models）
+// 静默返回预设的静态模型列表，确保向导始终有内容可显示。
+// 获取有 10 秒超时，是尽力而为的操作。
+//
+// 参数：
+//   - probe: 提供者条目（包含 BaseURL、ModelsURL 等）
+//   - famName: 家族名称（用于日志/提示显示）
+//
+// 返回值：模型名称列表（实时获取或静态回退）
 func fetchOrFallback(probe *config.ProviderEntry, famName string) []string {
 	static := probe.ModelList()
 	if probe.BaseURL == "" {
@@ -1048,17 +1270,25 @@ func fetchOrFallback(probe *config.ProviderEntry, famName string) []string {
 	return models
 }
 
-// fetchModelListCompat walks the full set of model-list URL candidates a given
-// base URL can resolve to (root, /v1, known OpenAI/Anthropic compat suffixes)
-// and returns the first successful fetch. This is the wizard-time probe for a
-// *user-supplied* custom provider — its baseURL is whatever the user pasted,
-// and "whatever they pasted" might be https://x.com (root, probe /v1/models)
-// or https://x.com/v1 (versioned, probe /v1/models directly). Previously the
-// wizard hardcoded `baseURL + "/models"`, which works for OpenAI-shape URLs
-// but silently fails for Anthropic-shape roots and the reverse — so the
-// wizard's idea of "what models exist" diverged from the chat client's actual
-// endpoint. Returning the empty slice (not an error) on full miss lets the
-// wizard fall through to a manual text input without an error message.
+// fetchModelListCompat 遍历给定 base URL 的所有模型列表 URL 候选项
+// （根路径、/v1、已知的 OpenAI/Anthropic 兼容后缀），返回第一个成功的获取结果。
+//
+// 这是向导阶段对 *用户提供的* 自定义提供者的探测——其 baseURL 是用户粘贴的，
+// 可能是 https://x.com（根路径，探测 /v1/models）或 https://x.com/v1
+// （版本化路径，直接探测 /v1/models）。
+//
+// 设计背景：之前向导硬编码 `baseURL + "/models"`，对 OpenAI 格式的 URL 有效，
+// 但对 Anthropic 格式的根路径会静默失败——导致向导的"有哪些模型"与聊天客户端的
+// 实际端点不一致。在完全未命中时返回空切片（非错误），使向导可以回退到手动输入。
+//
+// 参数：
+//   - ctx: 上下文（用于超时控制）
+//   - baseURL: 提供者的 base URL
+//   - apiKey: API 密钥（用于认证探测请求）
+//
+// 返回值：
+//   - []string: 模型名称列表（空表示完全未命中）
+//   - error: 非端点未命里的错误（如认证失败、5xx、TLS 错误）
 func fetchModelListCompat(ctx context.Context, baseURL, apiKey string) ([]string, error) {
 	candidates, err := config.BuildModelFetchURLs(baseURL, "")
 	if err != nil {
@@ -1084,19 +1314,19 @@ func fetchModelListCompat(ctx context.Context, baseURL, apiKey string) ([]string
 	return nil, nil
 }
 
-// buildFamilyEntry returns a single ProviderEntry exposing the user's
-// selected models under one entry. It preserves the preset's API key env,
-// base URL, kind, context window, pricing, and effort — the things that
-// vary per vendor but not per model. The Default pointer is reset to the
-// first selected model if it would otherwise reference a model the user
-// didn't pick (or was empty).
-// buildFamilyEntries splits the user's selection back across the family's preset
-// members so each model keeps its own entry — and therefore its own pricing,
-// context window, and balance URL. A family like DeepSeek ships flash and pro as
-// separate presets with different prices; collapsing them into one entry would
-// bill pro at flash's rate. Models the live /models list returned that match no
-// preset (a new SKU) fall under the probe entry. Member order is preserved;
-// within a member, selection order is preserved.
+// buildFamilyEntries 将用户选择的模型分配回家族的预设成员中，
+// 使每个模型保持自己的条目——从而保持各自的价格、上下文窗口和余额 URL。
+//
+// 例如 DeepSeek 家族将 flash 和 pro 作为独立预设（价格不同）发布；
+// 如果合并为一个条目，pro 会按 flash 的费率计费。实时 /models 列表返回的
+// 不匹配任何预设的新 SKU 归属到探测条目下。
+//
+// 参数：
+//   - probe: 探测条目（包含 base URL、API key 等共享信息）
+//   - members: 家族的预设成员列表
+//   - selected: 用户选择的模型名称列表
+//
+// 返回值：按成员分组的 ProviderEntry 列表（保持成员顺序和选择顺序）
 func buildFamilyEntries(probe config.ProviderEntry, members []config.ProviderEntry, selected []string) []config.ProviderEntry {
 	tmpl := map[string]config.ProviderEntry{probe.Name: probe}
 	ownerName := map[string]string{}
@@ -1125,6 +1355,15 @@ func buildFamilyEntries(probe config.ProviderEntry, members []config.ProviderEnt
 	return out
 }
 
+// buildFamilyEntry 构建单个家族条目，将用户选择的模型列表设置到探测条目中。
+// 保留预设的 API key env、base URL、kind、context window、pricing 和 effort。
+// 如果 Default 指向用户未选择的模型，则重置为第一个选中的模型。
+//
+// 参数：
+//   - probe: 探测条目模板
+//   - selected: 用户选择的模型名称列表
+//
+// 返回值：配置好的 ProviderEntry
 func buildFamilyEntry(probe config.ProviderEntry, selected []string) config.ProviderEntry {
 	entry := probe
 	entry.Models = selected
@@ -1135,6 +1374,8 @@ func buildFamilyEntry(probe config.ProviderEntry, selected []string) config.Prov
 	return entry
 }
 
+// containsString 检查字符串切片中是否包含指定值。
+// 用于简单的线性查找场景。
 func containsString(xs []string, v string) bool {
 	for _, x := range xs {
 		if x == v {
@@ -1144,14 +1385,16 @@ func containsString(xs []string, v string) bool {
 	return false
 }
 
-// filterStaleCustomEntries drops the wizard's own magic-name entries
-// (Name="custom" with Kind="openai" or Name="anthropic" with Kind="anthropic")
-// that older versions of the wizard wrote into reasonix.toml. They collide
-// with the wizard's "custom" / "anthropic" menu items on re-run, showing up
-// as duplicate broken entries. The new wizard writes host-derived slugs
-// (e.g. "custom-token-sensenova-cn") so a hit on the magic name is
-// unambiguously stale. The returned slice is the dropped set so the caller
-// can warn the user to clean up reasonix.toml by hand.
+// filterStaleCustomEntries 过滤掉旧版向导写入的魔术名称条目
+// （Name="custom" + Kind="openai" 或 Name="anthropic" + Kind="anthropic"）。
+//
+// 这些条目在重新运行向导时会与菜单项冲突，显示为重复的损坏条目。
+// 新版向导使用基于主机名的 slug（如 "custom-token-sensenova-cn"），
+// 因此命中魔术名称的条目确定是过期的。
+//
+// 返回值：
+//   - kept: 保留的有效条目
+//   - dropped: 被过滤的过期条目（调用方应警告用户手动清理）
 func filterStaleCustomEntries(providers []config.ProviderEntry) (kept, dropped []config.ProviderEntry) {
 	for _, p := range providers {
 		if p.Name == "custom" && p.Kind == "openai" {
@@ -1167,15 +1410,19 @@ func filterStaleCustomEntries(providers []config.ProviderEntry) (kept, dropped [
 	return
 }
 
-// providerSlug derives a stable, human-readable entry name for a custom
-// OpenAI / Anthropic-compatible provider from its base URL, e.g.
-// "custom-token-sensenova-cn" or "anthropic-api-anthropic-com". We can't
-// reuse the wizard's menu-item labels ("custom" / "anthropic") because
-// those would collide with the menu item itself and end up rendered as
-// duplicate provider entries on subsequent re-runs of `reasonix setup`.
-// The host-based slug also gives users a meaningful name to grep for in
-// reasonix.toml. Falls back to a short sha1 of the raw URL when the URL
-// doesn't parse, so even malformed input still produces a unique name.
+// providerSlug 从 base URL 派生出稳定、人类可读的自定义提供者条目名称。
+// 例如 "custom-token-sensenova-cn" 或 "anthropic-api-anthropic-com"。
+//
+// 不能复用向导的菜单项标签（"custom"/"anthropic"），因为会与菜单项本身冲突，
+// 在后续重新运行 `reasonix setup` 时显示为重复条目。
+// 基于主机名的 slug 也给用户一个有意义的名称，便于在 reasonix.toml 中搜索。
+// 当 URL 无法解析时，回退到原始 URL 的短 sha1 哈希，确保即使格式错误的输入也能产生唯一名称。
+//
+// 参数：
+//   - kind: 提供者类型（"custom" 或 "anthropic"）
+//   - baseURL: 提供者的 base URL
+//
+// 返回值：生成的 slug 名称
 func providerSlug(kind, baseURL string) string {
 	var host string
 	if u, err := url.Parse(baseURL); err == nil {
@@ -1203,15 +1450,21 @@ func providerSlug(kind, baseURL string) string {
 	return kind + "-" + strings.TrimRight(b.String(), "-")
 }
 
-// providerFamily is a wizard-only grouping of provider SKUs by vendor; it does
-// not exist in config because users editing reasonix.toml deal with SKU names
-// directly.
+// providerFamily 是向导专用的提供者 SKU 按供应商分组。
+// 配置文件中不存在此概念，因为编辑 reasonix.toml 的用户直接处理 SKU 名称。
 type providerFamily struct {
 	key  string
 	name string
 	desc string
 }
 
+// familyOf 根据提供者名称确定其所属的家族。
+// 用于向导中的分组显示，例如 "deepseek-flash" 和 "deepseek-pro" 都属于 "deepseek" 家族。
+//
+// 参数：
+//   - name: 提供者名称
+//
+// 返回值：提供者家族信息
 func familyOf(name string) providerFamily {
 	switch {
 	case strings.HasPrefix(name, "deepseek"):
@@ -1221,7 +1474,12 @@ func familyOf(name string) providerFamily {
 	}
 }
 
-// promptCustomProvider handles the custom provider entry flow.
+// promptCustomProvider 处理自定义提供者的添加流程。
+// 显示方法选择菜单（手动输入或从 URL 获取），然后调用对应的处理函数。
+//
+// 返回值：
+//   - []config.ProviderEntry: 用户配置的提供者条目列表
+//   - error: 配置失败时返回错误
 func promptCustomProvider() ([]config.ProviderEntry, error) {
 	methodIdx, err := selectOne(i18n.M.CustomAddMethodLabel, []menuItem{
 		{name: i18n.M.CustomMethodManual},
@@ -1236,16 +1494,26 @@ func promptCustomProvider() ([]config.ProviderEntry, error) {
 	return promptCustomProviderFromURL()
 }
 
-// promptCustomProviderManual handles manual model entry.
+// promptCustomProviderManual 处理手动输入自定义提供者信息的流程。
+// 提示用户输入 base URL、API key 环境变量名、API key 和模型名称。
 func promptCustomProviderManual() ([]config.ProviderEntry, error) {
 	return promptCustomProviderManualWith(bufio.NewScanner(os.Stdin), "", "", "")
 }
 
-// promptCustomProviderManualWith is the shared backend for manual entry.
-// Pre-filled values (baseURL, keyEnv, apiKey) are reused as-is when non-empty
-// so the URL-fetch flow can fall through to manual entry without re-asking
-// the user for information they've already typed. An empty apiKey is allowed
-// — the key step happens later in the wizard and the credential store is updated then.
+// promptCustomProviderManualWith 是手动输入的共享后端。
+// 预填充值（baseURL、keyEnv、apiKey）在非空时直接复用，使 URL 获取流程
+// 可以回退到手动输入而无需重复询问用户已输入的信息。
+// 空 apiKey 是允许的——密钥步骤在向导的后续阶段进行，届时更新凭证存储。
+//
+// 参数：
+//   - in: 输入扫描器
+//   - baseURL: 预填充的 base URL（空则提示输入）
+//   - keyEnv: 预填充的环境变量名（空则提示输入）
+//   - apiKey: 预填充的 API key（空则提示输入）
+//
+// 返回值：
+//   - []config.ProviderEntry: 配置好的提供者条目
+//   - error: 输入失败时返回错误
 func promptCustomProviderManualWith(in *bufio.Scanner, baseURL, keyEnv, apiKey string) ([]config.ProviderEntry, error) {
 	fmt.Println()
 	if baseURL == "" {
@@ -1275,10 +1543,13 @@ func promptCustomProviderManualWith(in *bufio.Scanner, baseURL, keyEnv, apiKey s
 	return []config.ProviderEntry{entry}, nil
 }
 
-// promptCustomProviderFromURL tries the OpenAI-compatible GET /models
-// endpoint and shows a checkbox of the returned models. If the call fails
-// (network error, auth failure, or a vendor without /models) it falls
-// through to manual entry, reusing the URL and key the user already typed.
+// promptCustomProviderFromURL 尝试通过 OpenAI 兼容的 GET /models 端点获取模型列表，
+// 并显示返回模型的复选框供用户选择。如果请求失败（网络错误、认证失败、
+// 供应商不支持 /models），则回退到手动输入，复用用户已输入的 URL 和密钥。
+//
+// 返回值：
+//   - []config.ProviderEntry: 用户配置的提供者条目
+//   - error: 配置失败时返回错误
 func promptCustomProviderFromURL() ([]config.ProviderEntry, error) {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Println()
@@ -1327,7 +1598,12 @@ func promptCustomProviderFromURL() ([]config.ProviderEntry, error) {
 	return []config.ProviderEntry{entry}, nil
 }
 
-// promptAnthropicProvider handles the Anthropic compatible provider entry flow.
+// promptAnthropicProvider 处理 Anthropic 兼容提供者的添加流程。
+// 显示方法选择菜单（手动输入或从 URL 获取），然后调用对应的处理函数。
+//
+// 返回值：
+//   - []config.ProviderEntry: 用户配置的提供者条目列表
+//   - error: 配置失败时返回错误
 func promptAnthropicProvider() ([]config.ProviderEntry, error) {
 	methodIdx, err := selectOne(i18n.M.AnthropicAddMethodLabel, []menuItem{
 		{name: i18n.M.AnthropicMethodManual},
@@ -1342,15 +1618,13 @@ func promptAnthropicProvider() ([]config.ProviderEntry, error) {
 	return promptAnthropicProviderFromURL()
 }
 
-// promptAnthropicProviderManual handles manual model entry.
+// promptAnthropicProviderManual 处理手动输入 Anthropic 兼容提供者信息的流程。
 func promptAnthropicProviderManual() ([]config.ProviderEntry, error) {
 	return promptAnthropicProviderManualWith(bufio.NewScanner(os.Stdin), "", "", "")
 }
 
-// promptAnthropicProviderManualWith is the shared backend for manual entry
-// of an Anthropic-compatible custom provider. Pre-filled values (baseURL,
-// keyEnv, apiKey) are reused as-is when non-empty so the URL-fetch flow
-// can fall through to manual entry without re-asking the user.
+// promptAnthropicProviderManualWith 是 Anthropic 兼容提供者手动输入的共享后端。
+// 预填充值在非空时直接复用，使 URL 获取流程可以回退到手动输入而无需重复询问。
 func promptAnthropicProviderManualWith(in *bufio.Scanner, baseURL, keyEnv, apiKey string) ([]config.ProviderEntry, error) {
 	fmt.Println()
 	if baseURL == "" {
@@ -1380,11 +1654,10 @@ func promptAnthropicProviderManualWith(in *bufio.Scanner, baseURL, keyEnv, apiKe
 	return []config.ProviderEntry{entry}, nil
 }
 
-// promptAnthropicProviderFromURL tries the OpenAI-compatible GET /models
-// endpoint (some Anthropic-compatible proxies do expose one). Most don't
-// — Anthropic's own API has no public model list — so on any failure the
-// flow falls through to manual entry with the URL/key already filled in,
-// rather than aborting the wizard.
+// promptAnthropicProviderFromURL 尝试通过 OpenAI 兼容的 GET /models 端点获取模型列表
+// （部分 Anthropic 兼容代理确实暴露了此端点）。大多数不支持——
+// Anthropic 自身的 API 没有公开的模型列表——因此任何失败都会回退到手动输入，
+// 并复用已填写的 URL 和密钥，而不是中止向导。
 func promptAnthropicProviderFromURL() ([]config.ProviderEntry, error) {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Println()
@@ -1433,6 +1706,16 @@ func promptAnthropicProviderFromURL() ([]config.ProviderEntry, error) {
 	return []config.ProviderEntry{entry}, nil
 }
 
+// groupByFamily 将提供者列表按家族分组，返回家族顺序、成员索引映射和家族信息。
+// 用于向导中的分组显示和选择。
+//
+// 参数：
+//   - providers: 提供者列表
+//
+// 返回值：
+//   - []string: 家族键的顺序列表
+//   - map[string][]int: 家族键 → 成员在 providers 中的索引列表
+//   - map[string]providerFamily: 家族键 → 家族信息
 func groupByFamily(providers []config.ProviderEntry) ([]string, map[string][]int, map[string]providerFamily) {
 	var order []string
 	members := map[string][]int{}
@@ -1448,16 +1731,21 @@ func groupByFamily(providers []config.ProviderEntry) ([]string, map[string][]int
 	return order, members, info
 }
 
-// withBuiltinFamilies guarantees the wizard always offers the built-in DeepSeek
-// family even when the loaded config replaced the defaults.
-// Built-in entries whose exact name already exists in the user's config are
-// kept as-is (preserving customizations); missing built-in entries within an
-// existing family are appended so the model picker always shows the full
-// catalogue rather than only the previously selected subset.
+// withBuiltinFamilies 保证向导始终提供内置的 DeepSeek 家族，
+// 即使加载的配置替换了默认值。已存在于用户配置中的内置条目保持不变（保留自定义）；
+// 现有家族中缺失的内置条目会被追加，使模型选择器始终显示完整目录。
 func withBuiltinFamilies(providers []config.ProviderEntry) []config.ProviderEntry {
 	return withBuiltinFamiliesForLanguage(providers, "")
 }
 
+// withBuiltinFamiliesForLanguage 与 withBuiltinFamilies 类似，
+// 但接受价格语言参数以支持不同语言的价格显示。
+//
+// 参数：
+//   - providers: 当前提供者列表
+//   - pricingLanguage: 价格语言（如 "zh"、"en"）
+//
+// 返回值：合并了内置家族的提供者列表
 func withBuiltinFamiliesForLanguage(providers []config.ProviderEntry, pricingLanguage string) []config.ProviderEntry {
 	haveName := map[string]bool{}
 	for _, p := range providers {
@@ -1474,11 +1762,14 @@ func withBuiltinFamiliesForLanguage(providers []config.ProviderEntry, pricingLan
 	return providers
 }
 
-// providersWithMissingKeys returns the providers the active configuration
-// actually references (default/planner/subagent models) whose api_key_env is
-// declared but not set. Merely-available providers stay silent; the chat banner
-// still warns if users later switch to a model whose key is missing.
-// configureKeys dedupes shared envs, so duplicates are fine to leave in.
+// providersWithMissingKeys 返回活动配置实际引用的（默认/规划/子智能体模型）
+// 且 api_key_env 已声明但未设置的提供者。
+// 仅可用的提供者保持静默；聊天横幅仍会在用户切换到密钥缺失的模型时发出警告。
+//
+// 参数：
+//   - cfg: 配置对象
+//
+// 返回值：密钥缺失的提供者列表
 func providersWithMissingKeys(cfg *config.Config) []config.ProviderEntry {
 	if cfg == nil {
 		return nil
@@ -1519,13 +1810,21 @@ func providersWithMissingKeys(cfg *config.Config) []config.ProviderEntry {
 	return out
 }
 
-// configureKeys reconciles each enabled provider's API key with the
-// environment. For every distinct api_key_env: if the variable is already set,
-// setup asks whether to re-enter it; Enter keeps and re-pins the existing value.
-// Otherwise the user is asked once per env var (deduped across providers that
-// share one, e.g. both DeepSeek models). Returns KEY=value lines for the
-// configured credential store. Re-pinning matters because loadDotEnv is first-wins, so a stale key left
-// earlier in the credentials file would otherwise keep shadowing the fresh value.
+// configureKeys 协调每个已启用提供者的 API 密钥与环境变量。
+//
+// 对每个不同的 api_key_env：
+//   - 如果变量已设置，询问是否重新输入；Enter 保持并重新固定现有值
+//   - 否则每个环境变量询问一次（跨共享同一变量的提供者去重，如两个 DeepSeek 模型）
+//
+// 返回 KEY=value 行列表，用于写入凭证存储。重新固定很重要，因为 loadDotEnv
+// 是"先到先得"的，凭证文件中较早留下的过期密钥会遮蔽新值。
+//
+// 参数：
+//   - selected: 已启用的提供者列表
+//   - r: 输入源（通常是 os.Stdin）
+//   - w: 输出目标（通常是 os.Stdout）
+//
+// 返回值：KEY=value 格式的环境变量行列表
 func configureKeys(selected []config.ProviderEntry, r io.Reader, w io.Writer) []string {
 	in := bufio.NewScanner(r)
 	fmt.Fprintln(w, "\n"+i18n.M.EnterAPIKeysHeader)
@@ -1558,7 +1857,15 @@ func configureKeys(selected []config.ProviderEntry, r io.Reader, w io.Writer) []
 	return envLines
 }
 
-// ask prints a prompt to w and returns the entered line, or def if input is empty.
+// ask 向 w 输出提示并返回输入行，输入为空时返回默认值 def。
+//
+// 参数：
+//   - in: 输入扫描器
+//   - w: 输出目标
+//   - label: 提示标签
+//   - def: 默认值（输入为空时使用）
+//
+// 返回值：用户输入的字符串或默认值
 func ask(in *bufio.Scanner, w io.Writer, label, def string) string {
 	if def != "" {
 		fmt.Fprintf(w, "%s [%s]: ", label, def)
@@ -1574,24 +1881,32 @@ func ask(in *bufio.Scanner, w io.Writer, label, def string) string {
 	return def
 }
 
-// isInteractive reports whether we're attached to a real terminal on both
-// stdin and stdout — required for prompting. Redirected or piped I/O is not
-// interactive, so wizards never block or auto-default in scripts and CI.
+// isInteractive 检测是否连接到真正的终端（stdin 和 stdout 都是 TTY）。
+// 这是交互式提示的前提条件。重定向或管道的 I/O 不是交互式的，
+// 因此向导在脚本和 CI 中永远不会阻塞或自动使用默认值。
 func isInteractive() bool {
 	return isTTY(os.Stdin) && isTTY(os.Stdout)
 }
 
+// isTTY 检测给定文件是否为终端设备。
 func isTTY(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-// appendEnv merges KEY=value lines into a .env file. Existing assignments of
-// any key that's about to be written are dropped first, then the new values
-// are appended — so re-running `reasonix setup` with a corrected key replaces the
-// stale one instead of stacking duplicates (loadDotEnv is first-wins, so a
-// naive append would leave the old key in effect). The new values are also
-// pinned into the current process env so a chat session started right after
-// init picks up the fresh keys without a restart.
+// appendEnv 将 KEY=value 行合并到 .env 文件中。
+//
+// 处理逻辑：
+//  1. 先删除文件中即将写入的键的现有赋值
+//  2. 然后追加新值——使重新运行 `reasonix setup` 时修正的密钥替换过期密钥，
+//     而不是堆叠重复项（loadDotEnv 是"先到先得"的，简单追加会使旧密钥继续生效）
+//  3. 新值也被固定到当前进程环境变量中，使 init 后立即启动的聊天会话
+//     无需重启即可获取新密钥
+//
+// 参数：
+//   - path: .env 文件路径
+//   - lines: KEY=value 格式的行列表
+//
+// 返回值：写入失败时返回错误
 func appendEnv(path string, lines []string) error {
 	target := map[string]bool{}
 	for _, l := range lines {
@@ -1639,7 +1954,8 @@ func appendEnv(path string, lines []string) error {
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
-// readStdin reads piped input if present; an interactive terminal yields "".
+// readStdin 读取管道输入（如果存在）；交互式终端返回空字符串。
+// 用于 `reasonix run` 从管道接收提示，如 `echo "hello" | reasonix run`。
 func readStdin() string {
 	stat, err := os.Stdin.Stat()
 	if err != nil || stat.Mode()&os.ModeCharDevice != 0 {
@@ -1649,10 +1965,18 @@ func readStdin() string {
 	return strings.TrimSpace(string(data))
 }
 
+// usage 输出 CLI 的用法信息。
 func usage() {
 	fmt.Print(i18n.M.UsageBody)
 }
 
+// configCommand 实现 `reasonix config` 子命令：配置管理。
+// 支持的子命令：auto-plan、reasoning-language。
+//
+// 参数：
+//   - args: 子命令参数（如 ["auto-plan", "on"]）
+//
+// 返回值：进程退出码
 func configCommand(args []string) int {
 	if len(args) == 0 {
 		configUsage()
@@ -1669,6 +1993,13 @@ func configCommand(args []string) int {
 	}
 }
 
+// configAutoPlanCommand 实现 `reasonix config auto-plan` 子命令。
+// 读取或设置自动计划模式（off/on）。自动计划模式是用户级设置，不支持 --local。
+//
+// 参数：
+//   - args: 子命令参数（如 ["on"] 或 [] 用于读取当前值）
+//
+// 返回值：进程退出码
 func configAutoPlanCommand(args []string) int {
 	fs := flag.NewFlagSet("config auto-plan", flag.ContinueOnError)
 	local := fs.Bool("local", false, "unsupported; auto-plan is user-level only")
@@ -1713,6 +2044,13 @@ func configAutoPlanCommand(args []string) int {
 	return 0
 }
 
+// configReasoningLanguageCommand 实现 `reasonix config reasoning-language` 子命令。
+// 读取或设置推理语言（auto/zh/en）。支持 --local 标志写入项目本地配置。
+//
+// 参数：
+//   - args: 子命令参数（如 ["--local", "zh"] 或 [] 用于读取当前值）
+//
+// 返回值：进程退出码
 func configReasoningLanguageCommand(args []string) int {
 	fs := flag.NewFlagSet("config reasoning-language", flag.ContinueOnError)
 	local := fs.Bool("local", false, "write ./reasonix.toml instead of the user config")
@@ -1773,6 +2111,7 @@ func configReasoningLanguageCommand(args []string) int {
 	return 0
 }
 
+// configUsage 输出 `reasonix config` 的用法信息。
 func configUsage() {
 	fmt.Print(`Usage:
   reasonix config auto-plan [off|on]
@@ -1780,12 +2119,14 @@ func configUsage() {
 `)
 }
 
+// configAutoPlanUsage 输出 `reasonix config auto-plan` 的用法信息。
 func configAutoPlanUsage() {
 	fmt.Print(`Usage:
   reasonix config auto-plan [off|on]
 `)
 }
 
+// configReasoningLanguageUsage 输出 `reasonix config reasoning-language` 的用法信息。
 func configReasoningLanguageUsage() {
 	fmt.Print(`Usage:
   reasonix config reasoning-language [--local] [auto|zh|en]

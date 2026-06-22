@@ -1,3 +1,5 @@
+// rename.go 实现了 TUI 中的 /rename 子命令，用于重命名当前会话或
+// 从 /resume 列表中指定序号的历史会话。
 package cli
 
 import (
@@ -9,9 +11,9 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// runRenameCommand handles "/rename": with no argument it shows usage;
-// "/rename <new title>" renames the current session;
-// "/rename <n> <new title>" renames session #n from the /resume list.
+// runRenameCommand 处理 "/rename" 命令：无参数时显示用法说明；
+// "/rename <new title>" 重命名当前会话；
+// "/rename <n> <new title>" 重命名 /resume 列表中第 n 个历史会话。
 func (m *chatTUI) runRenameCommand(input string) {
 	args := tokenizeArgs(input) // args[0] == "/rename"
 

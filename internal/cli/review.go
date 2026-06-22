@@ -1,3 +1,6 @@
+// review.go 实现了 `reasonix review` 命令，用于对 Git 变更进行代码审查。
+// 它获取 diff、加载配置和模型、构建审查子代理并执行审查任务。
+// 支持审查未提交的工作区变更、指定 commit 或指定 base 分支的差异。
 package cli
 
 import (
@@ -15,6 +18,9 @@ import (
 	"reasonix/internal/tool"
 )
 
+// reviewCommand 是 `reasonix review` 的入口函数。它解析命令行参数，
+// 获取 Git diff，加载配置和模型，构建审查子代理并运行代码审查任务。
+// 支持 --base、--commit、--model 和 --instructions 参数。
 func reviewCommand(args []string) int {
 	fs := flag.NewFlagSet("review", flag.ContinueOnError)
 	base := fs.String("base", "", "base branch/commit to diff against (defaults to HEAD — reviews uncommitted working-tree changes)")
@@ -99,6 +105,9 @@ func reviewCommand(args []string) int {
 	return 0
 }
 
+// buildReviewSubagentRegistry 构建审查子代理的工具注册表。
+// 它从审查技能的允许工具列表中构建父注册表，
+// 然后通过 agent.SubagentToolRegistry 过滤掉子代理不可用的后台能力。
 func buildReviewSubagentRegistry(reviewSk skill.Skill) *tool.Registry {
 	// The shared helper strips subagent-unavailable background capabilities while
 	// preserving foreground bash. This direct CLI path does not go through boot,
@@ -112,10 +121,10 @@ func buildReviewSubagentRegistry(reviewSk skill.Skill) *tool.Registry {
 	return agent.SubagentToolRegistry(parentReg, reviewSk.AllowedTools)
 }
 
-// getReviewDiff runs the appropriate git diff command and returns its output.
-// - commit="abc": shows diff of abc^..abc
-// - base="main": shows diff of main...HEAD
-// - neither: shows diff of uncommitted working-tree changes
+// getReviewDiff 执行适当的 git diff 命令并返回输出。
+// - commit="abc": 显示 abc^..abc 的差异
+// - base="main": 显示 main...HEAD 的差异
+// - 两者都为空: 显示未提交的工作区变更（暂存区 + 非暂存区）
 func getReviewDiff(base, commit string) (string, error) {
 	cwd, _ := os.Getwd()
 	ctx := context.Background()
@@ -138,6 +147,8 @@ func getReviewDiff(base, commit string) (string, error) {
 	}
 }
 
+// buildReviewTask 构建审查提示词，将 diff 内容和额外指令组合为发送给子代理的任务文本。
+// 超大 diff 会被截断以保护审查子代理的上下文预算。
 func buildReviewTask(diff string, extra string) string {
 	var b strings.Builder
 	b.WriteString("Review the following changes. ")

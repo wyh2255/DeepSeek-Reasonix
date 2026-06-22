@@ -1,3 +1,8 @@
+// 文件：imagecompress.go
+//
+// 图片压缩——为视觉模型缩小过大图片。
+// OpenAI 和 Anthropic 在服务端大约缩放到 maxVisionDim，因此更大的上传
+// 只浪费请求字节和图片令牌而不增加保真度。本文件提供压缩/重新编码逻辑。
 package control
 
 import (

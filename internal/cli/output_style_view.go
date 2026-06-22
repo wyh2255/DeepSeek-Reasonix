@@ -1,3 +1,5 @@
+// output_style_view.go 负责将输出风格列表渲染为终端友好的格式化文本，
+// 供 /output-style 命令在 TUI 滚动区域中展示。
 package cli
 
 import (
@@ -7,6 +9,8 @@ import (
 	"reasonix/internal/outputstyle"
 )
 
+// renderOutputStyles 将输出风格列表渲染为格式化的终端文本，区分内置和自定义风格，
+// 标记当前活跃的风格，并附带配置提示。width 参数用于控制输出宽度。
 func renderOutputStyles(width int, styles []outputstyle.OutputStyle, active string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", viewHeader("output styles"))

@@ -12,13 +12,20 @@ import (
 
 func init() { tool.RegisterBuiltin(writeFile{}) }
 
-// writeFile writes a file. roots, when non-empty, confines the target to the
-// workspace (see confine); the zero value registered at init is unconfined and
-// is overridden per run by ConfineWriters. workDir, when non-empty, is the
-// directory a relative path resolves against (see resolveIn).
+// writeFile 实现了 write_file 工具，将内容写入文件（覆盖现有内容）。
+//
+// 特性：
+//   - 自动创建父目录
+//   - 保留原文件编码（GBK/UTF-16/BOM）而非强制写入 UTF-8
+//   - 内容未变化时跳过写入
+//   - 支持工作区边界限制（roots）
+//
+// roots 非空时限制写入目标在工作区内（见 confine）；init 注册的零值无限制，
+// 运行时通过 ConfineWriters 覆盖。
+// workDir 非空时用于解析相对路径。
 type writeFile struct {
-	roots   []string
-	workDir string
+	roots   []string // 可写入的根目录列表（工作区边界）
+	workDir string   // 相对路径解析基准目录
 }
 
 func (writeFile) Name() string { return "write_file" }

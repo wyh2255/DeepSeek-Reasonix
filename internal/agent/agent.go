@@ -1,3 +1,20 @@
+// Package agent 实现了 AI 编码代理的核心运行循环（agent loop）。
+//
+// 代理循环是整个系统的核心引擎，驱动以下流程：
+//  1. 用户输入 → 输入组合（注入记忆、推理语言偏好、计划模式标记等）
+//  2. 调用 Provider.Stream() 获取流式 Chunk
+//  3. 收集 Chunk：文本 → 实时显示，推理 → 思维链展示，工具调用 → 累积
+//  4. 如果有工具调用 → executeBatch() 执行（只读工具并行×8，写入工具串行）
+//  5. 工具结果追加到消息历史 → 回到步骤 2
+//  6. 如果没有工具调用且有文本 → 会话结束
+//
+// 关键机制：
+//   - 上下文压缩（compaction）：当 token 接近窗口限制时自动压缩历史
+//   - 会话持久化：每个助手消息（含推理）追加到 JSONL 文件
+//   - 流式中断恢复：连接断开时可追加尾部恢复提示而非重放
+//   - 风暴断路器（storm breaker）：检测并中断重复失败的死循环
+//   - 计划模式（plan mode）：只读探索模式，拒绝所有写入操作
+//   - 就绪性检查（readiness check）：确保最终答案前所有任务已完成并验证
 package agent
 
 import (
@@ -23,16 +40,15 @@ import (
 	"reasonix/internal/tool"
 )
 
-// maxToolOutputBytes caps a single tool result before it goes into the model's
-// context. ~32KB is roughly 8K tokens — enough for a full file read or a busy
-// grep, while preventing one accidental "read this 5 MB log" from blowing the
-// window before the next compaction runs.
+// maxToolOutputBytes 限制单个工具结果进入模型上下文之前的大小上限。
+// ~32KB 约等于 8K token——足够一次完整的文件读取或繁忙的 grep，
+// 同时防止意外的"读取这个 5MB 日志"操作在下次压缩运行之前耗尽窗口。
 const maxToolOutputBytes = 32 * 1024
 
-// planModeDeniedTools lists tools that are unconditionally denied in plan mode.
-// These are never shown to the LLM and cannot be called even if the agent
-// somehow references them. The write_file, edit_file, and multi_edit tools are
-// the canonical file-writing tools; apply_patch is a structured write variant.
+// planModeDeniedTools 列出在计划模式下被无条件拒绝的工具。
+// 这些工具不会展示给 LLM，即使代理以某种方式引用也无法调用。
+// write_file、edit_file 和 multi_edit 是标准的文件写入工具；
+// apply_patch 是结构化的写入变体。
 var planModeDeniedTools = map[string]bool{
 	"write_file":  true,
 	"edit_file":   true,
@@ -40,17 +56,15 @@ var planModeDeniedTools = map[string]bool{
 	"apply_patch": true,
 }
 
-// planModeBashMetachars defines shell metacharacters that indicate command
-// chaining, redirection, or substitution. When any of these appear in a bash
-// command during plan mode, the command is blocked — even if the command prefix
-// matches a safe read-only entry — because chaining can introduce side effects
-// after an otherwise safe prefix.
+// planModeBashMetachars 定义了表示命令链接、重定向或替换的 shell 元字符。
+// 在计划模式下，如果 bash 命令中出现这些字符中的任何一个，命令将被阻止——
+// 即使命令前缀匹配了安全的只读条目——因为链接可以在原本安全的前缀之后引入副作用。
 var planModeBashMetachars = []string{"&&", "||", ">>", "<<", "$(", "\x60", ";", "|", ">", "<", "&", "\n", "\r"}
 
-// planModeSafeBashCommands are bash command prefixes that are safe to run in
-// plan mode. Each entry is matched as a prefix against the trimmed, lowercased
-// command string. The match requires a shell-argument boundary after the prefix:
-// whitespace or end-of-string — so "echop" never matches "echo".
+// planModeSafeBashCommands 是在计划模式下可以安全运行的 bash 命令前缀列表。
+// 每个条目作为前缀与修剪后的小写命令字符串进行匹配。
+// 匹配要求前缀之后是 shell 参数边界：空白字符或字符串结尾——
+// 因此 "echop" 永远不会匹配 "echo"。
 var planModeSafeBashCommands = []string{
 	"git status", "git diff", "git log", "git show",
 	"git ls-files", "git grep", "git blame",
@@ -60,6 +74,8 @@ var planModeSafeBashCommands = []string{
 	"node -v", "npm list", "python --version",
 }
 
+// planModeFindWriteArgs 列出 find 命令中具有写入或执行副作用的参数。
+// 在计划模式下，包含这些参数的 find 命令将被阻止。
 var planModeFindWriteArgs = map[string]bool{
 	"-delete":  true,
 	"-exec":    true,
@@ -71,6 +87,8 @@ var planModeFindWriteArgs = map[string]bool{
 	"-fls":     true,
 }
 
+// planModeGoWriteOrExecArgs 列出 go 命令中具有写入或执行副作用的参数。
+// 在计划模式下，包含这些参数的 go 命令将被阻止。
 var planModeGoWriteOrExecArgs = map[string]bool{
 	"-fix":      true,
 	"-mod":      true,
@@ -79,54 +97,65 @@ var planModeGoWriteOrExecArgs = map[string]bool{
 	"-vettool":  true,
 }
 
+// maxFinalReadinessBlocks 是最终就绪性检查失败的最大允许次数。
+// 超过此次数将终止运行，防止代理无限重试。
 const maxFinalReadinessBlocks = 3
+
+// maxEmptyFinalBlocks 是模型给出空最终答案的最大允许次数。
+// 超过此次数将终止运行。
 const maxEmptyFinalBlocks = 3
+
+// maxStreamRecoveries 是流式中断恢复的最大允许次数。
+// 超过此次数将把错误传播给调用者。
 const maxStreamRecoveries = 1
+
+// maxExecutorHandoffNudges 是执行器交接提示的最大允许次数。
+// 当执行器在没有使用任何工具的情况下给出答案时，会提示它使用工具。
 const maxExecutorHandoffNudges = 1
 
-// Renderer redraws the assistant's final-answer text as styled output. It is
-// applied only after a turn's text stream completes, so the user sees raw
-// markdown stream live, then a single redraw replaces it with formatted
-// output. The renderer is intentionally interface-shaped so the agent stays
-// independent of the cli's markdown library choice. Consumed by TextSink.
+// Renderer 将助手的最终答案文本重新绘制为带样式的输出。
+// 它仅在回合的文本流完成后应用，因此用户先看到原始的 Markdown 流式传输，
+// 然后一次重绘将其替换为格式化的输出。
+// 渲染器被有意设计为接口形式，使代理保持独立于 CLI 的 Markdown 库选择。
+// 由 TextSink 消费使用。
 type Renderer interface {
 	Render(text string) string
 }
 
-// Asker puts structured multiple-choice questions to the user and blocks for the
-// answers. The agent consults it for the `ask` tool. It is interface-shaped so
-// the agent stays independent of the frontend; a nil asker means no interactive
-// user (headless runs), where `ask` returns a "decide for yourself" result. The
-// interactive frontends wire the controller in as the Asker.
+// Asker 向用户提出结构化的多选问题并阻塞等待答案。
+// 代理为 `ask` 工具咨询它。接口形式使代理保持独立于前端；
+// nil asker 表示无交互用户（无头运行），此时 `ask` 返回"自行决定"的结果。
+// 交互式前端将控制器作为 Asker 接入。
 type Asker interface {
 	Ask(ctx context.Context, questions []event.AskQuestion) ([]event.AskAnswer, error)
 }
 
-// callContextKey carries the executing tool call's identity into Execute.
+// callContextKey 将正在执行的工具调用的身份带入 Execute 方法。
+// 使用空结构体作为 context key 以避免与其他包冲突。
 type callContextKey struct{}
-type parentSessionContextKey struct{}
-type userImagesContextKey struct{}
+type parentSessionContextKey struct{} // 父会话 ID 的 context key
+type userImagesContextKey struct{}    // 用户图片附件的 context key
 
-// callContext is the per-call context a tool can read. parentID is the call being
-// executed and sink is the agent's event sink (the `task` tool uses both to nest
-// a sub-agent's events under this call); asker lets the `ask` tool reach the user.
+// callContext 是工具可以读取的每调用上下文。
+// 包含当前执行的调用信息，以便工具可以与代理的基础设施交互。
 type callContext struct {
-	parentID string
-	sink     event.Sink
-	asker    Asker
-	planMode bool
+	parentID string    // 正在执行的调用的 ID
+	sink     event.Sink // 代理的事件接收器（`task` 工具用于嵌套子代理事件）
+	asker    Asker     // 用于 `ask` 工具向用户提问
+	planMode bool      // 是否处于计划模式
 }
 
-// withCallContext stamps ctx with the executing call's ID, the agent's sink, and
-// the asker. executeOne sets this before every Execute; `task` reads it (via
-// CallContext) to nest sub-agent events, and `ask` reads the asker to prompt.
+// withCallContext 将正在执行的调用的 ID、代理的 Sink 和 Asker 附加到 ctx 上。
+// executeOne 在每次 Execute 之前设置此上下文；
+// `task` 工具读取它（通过 CallContext）以嵌套子代理事件，
+// `ask` 工具读取 Asker 以向用户提问。
 func withCallContext(ctx context.Context, parentID string, sink event.Sink, asker Asker, planMode bool) context.Context {
 	return context.WithValue(ctx, callContextKey{}, callContext{parentID: parentID, sink: sink, asker: asker, planMode: planMode})
 }
 
-// CallContext returns the executing call's ID, the agent's sink, and the asker,
-// if the context was set by an agent's executeOne. ok is false for a plain
-// context (headless tool tests, calls made outside the run loop).
+// CallContext 返回正在执行的调用的 ID、代理的 Sink 和 Asker，
+// 如果上下文是由代理的 executeOne 设置的。
+// 对于普通上下文（无头工具测试、在运行循环之外进行的调用），ok 为 false。
 func CallContext(ctx context.Context) (parentID string, sink event.Sink, asker Asker, ok bool) {
 	cc, ok := ctx.Value(callContextKey{}).(callContext)
 	if !ok {
@@ -135,30 +164,28 @@ func CallContext(ctx context.Context) (parentID string, sink event.Sink, asker A
 	return cc.parentID, cc.sink, cc.asker, true
 }
 
-// PlanModeFromContext reports whether the tool call is executing under the
-// agent's read-only planning gate. Tools that are themselves ReadOnly may use
-// this to avoid enabling follow-up writer-only surfaces during planning.
+// PlanModeFromContext 报告工具调用是否在代理的只读计划门控下执行。
+// 本身是 ReadOnly 的工具可以使用此方法来避免在计划期间启用后续的仅写入表面。
 func PlanModeFromContext(ctx context.Context) bool {
 	cc, ok := ctx.Value(callContextKey{}).(callContext)
 	return ok && cc.planMode
 }
 
-// WithParentSession stamps the active parent session ID onto a turn context so
-// persisted sub-agents can record and enforce their owning conversation.
+// WithParentSession 将活跃的父会话 ID 附加到回合上下文上，
+// 以便持久化的子代理可以记录和强制其所属的对话。
 func WithParentSession(ctx context.Context, parentSession string) context.Context {
 	return context.WithValue(ctx, parentSessionContextKey{}, strings.TrimSpace(parentSession))
 }
 
-// ParentSession returns the active parent session ID carried by a turn context.
+// ParentSession 返回回合上下文携带的活跃父会话 ID。
 func ParentSession(ctx context.Context) string {
 	parentSession, _ := ctx.Value(parentSessionContextKey{}).(string)
 	return strings.TrimSpace(parentSession)
 }
 
-// WithUserImages carries the data URLs of images the user attached to this turn,
-// resolved by the controller (which owns attachments) since the agent must not
-// depend on it. Run embeds them on the user message; the provider sends them only
-// when the model is vision-capable.
+// WithUserImages 携带用户附加到此回合的图片的数据 URL，
+// 由控制器（拥有附件管理）解析，因为代理不应依赖它。
+// Run 将它们嵌入用户消息；仅当模型具有视觉能力时提供者才会发送它们。
 func WithUserImages(ctx context.Context, images []string) context.Context {
 	return context.WithValue(ctx, userImagesContextKey{}, images)
 }
@@ -168,208 +195,215 @@ func userImages(ctx context.Context) []string {
 	return images
 }
 
-// Gate decides, per tool call, whether it may run. The agent consults it at
-// execute time (after the plan-mode gate). It is interface-shaped so the agent
-// stays independent of the permission package and of how "ask" is resolved
-// (silently in headless runs, interactively in the chat TUI). A nil gate means
-// no gating — every call runs, preserving behaviour for callers that don't wire
-// one in. reason is fed back to the model when allow is false; a non-nil err
-// (e.g. ctx cancelled awaiting approval) is treated as a block for that call.
+// Gate 在每次工具调用时决定是否允许运行。
+// 代理在执行时（计划模式门控之后）咨询它。
+// 接口形式的设计使代理保持独立于权限包和 "ask" 的解析方式
+// （无头运行中静默解析，聊天 TUI 中交互式解析）。
+// nil gate 表示无门控——每个调用都运行，为未接入门控的调用者保留行为。
+// 当 allow 为 false 时，reason 反馈给模型；非 nil 的 err
+// （例如等待批准时 ctx 被取消）被视为对该调用的阻止。
 type Gate interface {
 	Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
 }
 
-// ToolHooks fires user-configured shell hooks around each tool call. PreToolUse
-// runs before the call and may block it (block=true; message is the reason fed
-// back to the model); PostToolUse runs after and only surfaces output to the
-// user (it can't block). It is interface-shaped so the agent stays independent
-// of the hook package — a nil hooks field disables hook firing entirely.
+// ToolHooks 在每个工具调用前后触发用户配置的 shell 钩子。
+// PreToolUse 在调用前运行，可能阻止它（block=true；message 是反馈给模型的原因）；
+// PostToolUse 在调用后运行，只向用户展示输出（不能阻止）。
+// 接口形式的设计使代理保持独立于钩子包——nil hooks 字段完全禁用钩子触发。
 type ToolHooks interface {
+	// PreToolUse 在工具调用前运行。返回 block=true 可阻止调用。
 	PreToolUse(ctx context.Context, name string, args json.RawMessage) (block bool, message string)
+	// PostToolUse 在工具调用后运行。只能观察结果，不能阻止。
 	PostToolUse(ctx context.Context, name string, args json.RawMessage, result string)
-	// PostLLMCall fires after each model turn completes (streaming finishes)
-	// but before reasoning_content is stored. It returns the (possibly
-	// translated) reasoning string — the original when no hook is configured.
-	// HasPostLLMCall reports whether such a hook exists, so the agent keeps
-	// streaming reasoning live when none is wired up.
+
+	// PostLLMCall 在每个模型回合完成（流式传输结束）后、推理内容存储之前触发。
+	// 返回（可能已翻译的）推理字符串——未配置钩子时返回原始字符串。
+	// HasPostLLMCall 报告此类钩子是否存在，以便代理在没有钩子时保持推理的实时流式传输。
 	PostLLMCall(ctx context.Context, reasoning string, turn int) string
 	HasPostLLMCall() bool
-	// SubagentStop fires when a `task` sub-agent finishes (foreground). PreCompact
-	// fires just before a compaction pass and returns extra summary guidance (its
-	// hooks' stdout) to fold into the summary prompt; "" when no hook contributes.
+
+	// SubagentStop 在 `task` 子代理完成（前台）时触发。
 	SubagentStop(ctx context.Context, last string)
+	// PreCompact 在压缩过程之前触发，返回额外的摘要指导（其钩子的 stdout）
+	// 以折叠到摘要提示中；无钩子贡献时返回 ""。
 	PreCompact(ctx context.Context, trigger string) string
 }
 
-// Agent drives a single task: a Provider, a tool Registry, and a Session wired
-// into the main loop.
+// Agent 驱动单个任务：将一个 Provider、一个工具 Registry 和一个 Session
+// 连接到主循环中。它是 AI 编码代理的核心运行时结构。
 type Agent struct {
-	prov        provider.Provider
-	tools       *tool.Registry
-	session     *Session
-	sessMu      sync.Mutex // guards the session pointer for external Session()/SetSession
-	maxSteps    int
-	maxStepsKey string
-	// executorHandoffGuard is enabled by Coordinator for the executor agent. The
-	// per-turn marker check in Run keeps ordinary single-model turns unaffected.
-	executorHandoffGuard bool
-	temperature          float64
-	pricing              *provider.Pricing
-	usageSource          string
-	reasoningLanguage    atomic.Value // string: auto|zh|en
+	prov        provider.Provider // 模型提供者（如 OpenAI、DeepSeek 等）
+	tools       *tool.Registry    // 工具注册表，管理所有可用工具
+	session     *Session          // 当前会话，包含消息历史
+	sessMu      sync.Mutex        // 保护 session 指针，用于外部 Session()/SetSession 的并发访问
+	maxSteps    int               // 工具调用回合的最大步数（<=0 表示无限制）
+	maxStepsKey string            // 配置键名，用于在达到上限时显示给用户
 
-	// sink receives the turn's typed event stream (reasoning/text deltas, tool
-	// dispatch/results, usage, notices). The agent no longer formats output
-	// itself — a frontend's Sink decides how to render. Never nil; New defaults
-	// it to event.Discard.
+	// executorHandoffGuard 由协调器（Coordinator）为执行器代理启用。
+	// Run 中的每回合标记检查使普通的单模型回合不受影响。
+	executorHandoffGuard bool
+
+	temperature float64          // 模型采样温度
+	pricing     *provider.Pricing // 可选的定价信息，用于成本显示
+	usageSource string            // 计费使用量来源标识
+
+	// reasoningLanguage 控制可见推理语言偏好：auto|zh|en
+	// 使用 atomic.Value 以便在回合间安全更新。
+	reasoningLanguage atomic.Value
+
+	// sink 接收回合的类型化事件流（推理/文本增量、工具分派/结果、使用量、通知）。
+	// 代理不再自行格式化输出——前端的 Sink 决定如何渲染。
+	// 永不为 nil；New 构造函数默认将其设为 event.Discard。
 	sink event.Sink
 
-	// lastUsage caches the most recent per-turn telemetry the provider reported so
-	// the CLI can expose a context gauge without re-scraping the usage line. The
-	// run loop writes it while a frontend's status line reads it, so it is atomic.
+	// lastUsage 缓存提供者报告的最近一次每回合遥测数据，
+	// 以便 CLI 可以在不重新抓取使用量行的情况下暴露上下文仪表。
+	// 运行循环写入它，前端的状态行读取它，因此使用 atomic。
 	lastUsage atomic.Pointer[provider.Usage]
 
-	// sessCacheHit/sessCacheMiss accumulate cache tokens across every API call
-	// this session, so frontends can show the aggregate hit-rate (Σhit/Σ(hit+miss))
-	// — a steadier, cost-oriented number than the single-turn rate. They are NOT
-	// reset on compaction (compaction only rewrites session.Messages), so the
-	// aggregate never craters when the prefix is summarized away. Atomic: the run
-	// loop accumulates them while the status line reads them.
+	// sessCacheHit/sessCacheMiss 累积本会话每次 API 调用的缓存 token 数，
+	// 以便前端可以显示聚合命中率（Σhit/Σ(hit+miss)）——
+	// 这是一个比单回合命中率更稳定的、面向成本的指标。
+	// 它们不会在压缩时重置（压缩只重写 session.Messages），
+	// 因此当前缀被摘要化时聚合值不会骤降。
+	// 使用 atomic：运行循环累积它们，状态行读取它们。
 	sessCacheHit  atomic.Int64
 	sessCacheMiss atomic.Int64
 
-	// lastPrefixShape records the previous provider request's cacheable prefix
-	// so usage events can explain prefix churn on the next request.
+	// lastPrefixShape 记录上一次提供者请求的可缓存前缀，
+	// 以便使用量事件可以解释下一次请求的前缀流失。
 	lastPrefixShape     PrefixShape
 	haveLastPrefixShape bool
 
-	// planMode, when true, refuses any tool call whose ReadOnly() is false.
-	// The system prompt and tool list never change with the toggle so the
-	// prompt-cache prefix stays valid; the gating happens at execute time
-	// and the model sees a "blocked" result it can adapt to. Toggled from
-	// the outside via SetPlanMode.
+	// planMode 为 true 时，拒绝任何 ReadOnly() 返回 false 的工具调用。
+	// 系统提示和工具列表不会随切换而改变，因此提示缓存前缀保持有效；
+	// 限制发生在执行时，模型会看到一个 "blocked" 结果并可以适应。
+	// 通过外部的 SetPlanMode 切换。
 	planMode atomic.Bool
 
-	// gate, when non-nil, is the per-call permission gate consulted after the
-	// plan-mode check. nil disables gating entirely.
+	// gate 非 nil 时，是在计划模式检查之后咨询的每调用权限门控。
+	// nil 完全禁用门控。
 	gate Gate
 
-	// hooks, when non-nil, fires PreToolUse / PostToolUse shell hooks around each
-	// tool call. nil disables hook firing.
+	// hooks 非 nil 时，在每个工具调用前后触发 PreToolUse/PostToolUse shell 钩子。
+	// nil 禁用钩子触发。
 	hooks ToolHooks
 
-	// asker, when non-nil, lets the `ask` tool put questions to the user. nil in
-	// headless runs (no interactive user). Set via SetAsker.
+	// asker 非 nil 时，允许 `ask` 工具向用户提问。
+	// 在无头运行（无交互用户）中为 nil。通过 SetAsker 设置。
 	asker Asker
 
-	// onPreEdit, when non-nil, is called with a writer tool's previewed change
-	// just before it runs — the seam the checkpoint store uses to snapshot a
-	// file's pre-edit content. Only fires for non-ReadOnly tools that implement
-	// tool.Previewer (so bash, whose targets are unknowable, is never tracked).
-	// Set via SetPreEditHook.
+	// onPreEdit 非 nil 时，在写入工具运行之前被调用，传入预览的变更——
+	// 这是检查点存储用来快照文件编辑前内容的接口。
+	// 仅对实现了 tool.Previewer 的非 ReadOnly 工具触发
+	// （因此 bash 从不被跟踪，因为其目标不可预知）。
+	// 通过 SetPreEditHook 设置。
 	onPreEdit func(diff.Change)
 
-	// jobs, when non-nil, is the session's background-job manager. executeOne
-	// stamps it onto each tool call's context so the background tools (bash
-	// run_in_background, task run_in_background, bash_output/kill_shell/wait) can
-	// reach it. nil leaves those tools to degrade gracefully.
+	// jobs 非 nil 时，是会话的后台任务管理器。
+	// executeOne 将其附加到每个工具调用的上下文中，
+	// 以便后台工具（bash run_in_background, task run_in_background,
+	// bash_output/kill_shell/wait）可以访问它。
+	// nil 使这些工具优雅降级。
 	jobs *jobs.Manager
 
-	// steerQueue holds mid-turn user messages queued while the agent is
-	// running. Each is consumed once per loop iteration, persisted to the
-	// session for history replay, and sent to the model as guidance (not a
-	// new task). Cache miss for the next API call is unavoidable but limited
-	// to one call — the prefix stays stable otherwise.
+	// steerQueue 持有在代理运行期间排队的回合中途用户消息。
+	// 每条消息在每次循环迭代中被消费一次，持久化到会话以供历史重放，
+	// 并作为指导（而非新任务）发送给模型。
+	// 下一次 API 调用的缓存未命中是不可避免的，但仅限于一次调用——
+	// 前缀在其他情况下保持稳定。
 	steerMu       sync.Mutex
 	steerQueue    []string
 	steerConsumed bool
 
-	// evidence is a per-user-turn ledger of host-observed tool receipts. It lets
-	// complete_step validate that cited evidence happened before the claim.
+	// evidence 是每用户回合的主机观察到的工具回执账本。
+	// 它让 complete_step 可以验证引用的证据发生在声明之前。
 	evidence *evidence.Ledger
 
-	// todoState is the host's canonical task list: the latest successful
-	// todo_write with completions applied by complete_step. Unlike the per-turn
-	// ledger it survives turn boundaries and compaction (it never rides in the
-	// prompt), so the final-answer gate still sees an unfinished plan a later
-	// turn would otherwise hide. Rebuilt from the session in SetSession.
+	// todoState 是主机的规范任务列表：最近一次成功的 todo_write，
+	// 加上 complete_step 应用的完成状态。
+	// 与每回合账本不同，它跨越回合边界和压缩存活（它从不搭载在提示中），
+	// 因此最终答案门控仍然能看到后续回合会隐藏的未完成计划。
+	// 在 SetSession 中从会话重建。
 	todoMu    sync.Mutex
 	todoState []evidence.TodoItem
 
-	// hostAdvanceSeq guarantees unique tool IDs across turns: every
-	// emitTodoState call increments it so the frontend always sees a fresh
-	// dispatch even when the same panel index is signed off in different turns.
+	// hostAdvanceSeq 保证跨回合的工具 ID 唯一性：
+	// 每次 emitTodoState 调用都递增它，因此即使相同的面板索引在不同回合中被签出，
+	// 前端也能看到新的分派。
 	hostAdvanceSeq atomic.Int64
 
-	// projectChecks are structured project instructions that complete_step can
-	// verify against same-turn bash receipts after a write-backed completion.
+	// projectChecks 是结构化的项目指令，complete_step 可以在写入支持的完成之后
+	// 对同回合的 bash 回执进行验证。
 	projectChecks []instruction.VerifyCheck
 
-	// memQueue, when non-nil, lets the remember/forget tools fold a turn-tail note
-	// about a just-made memory change into the next turn, so it applies this
-	// session without touching the cache-stable prefix. Set via SetMemoryQueue.
+	// memQueue 非 nil 时，允许 remember/forget 工具将刚做出的记忆变更的回合尾注
+	// 折叠到下一回合中，使其在本会话中生效而不触及缓存稳定的前缀。
+	// 通过 SetMemoryQueue 设置。
 	memQueue memory.Queue
 
-	// planModeAllowedTools is the set of tool names that are exempt from the
-	// plan-mode gate. When non-empty, these tools bypass the read-only check.
-	// Populated from Options.PlanModeAllowedTools during construction.
+	// planModeAllowedTools 是免除计划模式门控的工具名称集合。
+	// 非空时，这些工具绕过只读检查。
+	// 在构造期间从 Options.PlanModeAllowedTools 填充。
 	planModeAllowedTools map[string]bool
 
-	// Context management: when a turn's prompt nears contextWindow, the older
-	// middle of the session is summarized away, keeping a token-bounded recent
-	// tail verbatim (recentKeep is the message floor) and archiving the originals
-	// under archiveDir. compactStuck latches when compaction can't get the prompt
-	// under the window (consecutiveCompacts crosses the limit), so auto-compaction
-	// pauses instead of looping. softCompactNoticed gates the one-shot soft-ratio
-	// notice so it fires once per approach, not every turn.
-	contextWindow       int
-	softCompactRatio    float64
-	compactRatio        float64
-	compactForceRatio   float64
-	softCompactNoticed  bool
-	recentKeep          int
-	archiveDir          string
-	keepPolicy          KeepPolicy
-	compactStuck        bool
-	consecutiveCompacts int
+	// ===== 上下文管理 =====
+	// 当回合的提示接近 contextWindow 时，会话中间的较旧消息被摘要化，
+	// 保留一个 token 限制的最近尾部（recentKeep 是消息下限），
+	// 并将原始消息归档到 archiveDir 下。
+	// compactStuck 在压缩无法将提示降至窗口以下时锁定
+	// （consecutiveCompacts 超过限制），使自动压缩暂停而非循环。
+	// softCompactNoticed 控制一次性软比率通知，使其每次接近触发一次而非每回合。
+	contextWindow       int         // 上下文窗口大小（token 数）
+	softCompactRatio    float64     // 软压缩触发比率
+	compactRatio        float64     // 自动压缩触发比率
+	compactForceRatio   float64     // 强制压缩触发比率
+	softCompactNoticed  bool        // 软压缩通知是否已发出
+	recentKeep          int         // 压缩时保留的最近消息数
+	archiveDir          string      // 原始消息的归档目录
+	keepPolicy          KeepPolicy  // 压缩时保留消息的策略
+	compactStuck        bool        // 压缩是否卡住（无法进一步压缩）
+	consecutiveCompacts int         // 连续压缩次数
 
-	// stormSig / stormCount track a run of turns that keep failing the same way so
-	// the loop can break a death-spiral. The signature is each call's (tool, error)
-	// in order, NOT (tool, args): a stuck model reliably reworks the arguments
-	// cosmetically (a re-worded essay, a reordered object) while the call fails
-	// identically every time — keying on args misses the loop entirely (observed
-	// live against truncated tool-call arguments). Because errors that embed their
-	// subject (e.g. "file not found: /x") differ per target, genuine varied probing
-	// does not collapse to one signature. Reset whenever a turn does anything else
-	// (a different failure shape, or any success). See applyStormBreaker.
+	// stormSig / stormCount 跟踪以相同方式连续失败的回合序列，
+	// 以便循环可以打破死亡螺旋。
+	// 签名是每个调用的 (tool, error) 按顺序排列，NOT (tool, args)：
+	// 卡住的模型会可靠地对参数进行表面修改（重新措辞的文章、重新排序的对象），
+	// 而调用每次都以相同方式失败——基于 args 的键控会完全错过循环
+	// （在截断的工具调用参数上实时观察到）。
+	// 因为嵌入其主题的错误（如 "file not found: /x"）因目标而异，
+	// 真正的多样化探测不会坍缩为一个签名。
+	// 当回合做了任何其他事情时重置（不同的失败形状，或任何成功）。
+	// 参见 applyStormBreaker。
 	stormSig   string
 	stormCount int
 
-	// repeatSuccessCounts tracks write-like tool calls that have already
-	// succeeded in this user turn. This catches the complementary loop shape to
-	// stormSig: a model keeps doing the same successful write, so there is no
-	// error for the failure-only storm breaker to see.
+	// repeatSuccessCounts 跟踪本用户回合中已经成功的写入类工具调用。
+	// 这捕获了 stormSig 的互补循环形状：
+	// 模型不断执行相同的成功写入，因此没有错误供仅关注失败的风暴断路器看到。
 	repeatSuccessCounts map[string]int
 }
 
-// KeepPolicy is a bitmask controlling which messages are preserved beyond the
-// recent tail during compaction.
+// KeepPolicy 是一个位掩码，控制在压缩期间除了最近尾部之外还保留哪些消息。
 type KeepPolicy int
 
 const (
+	// KeepErrors 保留包含错误的工具结果消息，便于调试。
 	KeepErrors KeepPolicy = 1 << iota
+	// KeepUserMarked 保留用户标记的消息。
 	KeepUserMarked
 )
 
-// SetPlanMode flips the read-only gate. While true, executeOne refuses any
-// non-ReadOnly tool the model calls and returns a "blocked" result instead of
-// running it. The cache-friendly bits — system prompt, tools schema, message
-// history — are left untouched, so the toggle costs nothing in cache hits.
+// SetPlanMode 切换只读门控。
+// 当为 true 时，executeOne 拒绝模型调用的任何非 ReadOnly 工具，
+// 并返回 "blocked" 结果而非运行它。
+// 缓存友好的部分——系统提示、工具模式、消息历史——保持不变，
+// 因此切换在缓存命中方面不产生任何成本。
 func (a *Agent) SetPlanMode(v bool) { a.planMode.Store(v) }
 
-// SetTools replaces the agent's tool registry. The next API call picks up the
-// new tool schema; tools already cached in the provider prefix are unaffected
-// until the prefix is invalidated. Safe to call between turns.
+// SetTools 替换代理的工具注册表。
+// 下一次 API 调用会使用新的工具模式；已经缓存在提供者前缀中的工具不受影响，
+// 直到前缀被失效。在回合之间调用是安全的。
 func (a *Agent) SetTools(tools *tool.Registry) {
 	if a == nil {
 		return
@@ -377,8 +411,7 @@ func (a *Agent) SetTools(tools *tool.Registry) {
 	a.tools = tools
 }
 
-// SetReasoningLanguage updates the visible reasoning language preference for
-// subsequent user-role messages emitted by this agent.
+// SetReasoningLanguage 更新此代理发出的后续用户角色消息的可见推理语言偏好。
 func (a *Agent) SetReasoningLanguage(lang string) {
 	if a == nil {
 		return
@@ -386,9 +419,9 @@ func (a *Agent) SetReasoningLanguage(lang string) {
 	a.reasoningLanguage.Store(NormalizeReasoningLanguage(lang))
 }
 
-// SetGate installs the per-call permission gate. Used by interactive CLI sessions to swap the
-// headless gate built in setup for an interactive one that prompts the user;
-// nil disables gating. Safe to call before the run loop starts.
+// SetGate 安装每调用的权限门控。
+// 由交互式 CLI 会话使用，将启动时构建的无头门控替换为提示用户的交互式门控；
+// nil 禁用门控。在运行循环开始之前调用是安全的。
 func (a *Agent) SetGate(g Gate) {
 	if nilutil.IsNil(g) {
 		g = nil
@@ -396,6 +429,8 @@ func (a *Agent) SetGate(g Gate) {
 	a.gate = g
 }
 
+// withReasoningLanguage 将推理语言偏好注入到用户输入中。
+// 如果偏好为 "auto" 或空，则不注入任何内容。
 func (a *Agent) withReasoningLanguage(input string) string {
 	if a == nil {
 		return input
@@ -409,76 +444,74 @@ func (a *Agent) withReasoningLanguage(input string) string {
 	return WithReasoningLanguage(input, lang)
 }
 
-// SetAsker installs the asker the `ask` tool uses to question the user.
-// Interactive frontends wire one in; headless runs leave it nil.
+// SetAsker 安装 `ask` 工具用于向用户提问的提问器。
+// 交互式前端接入一个实例；无头运行保持为 nil。
 func (a *Agent) SetAsker(as Asker) { a.asker = as }
 
-// SetMemoryQueue installs the sink the remember/forget tools use to apply a
-// memory change in the current session. The controller wires itself in.
+// SetMemoryQueue 安装 remember/forget 工具用于在当前会话中应用记忆变更的接收器。
+// 控制器将自身接入。
 func (a *Agent) SetMemoryQueue(q memory.Queue) { a.memQueue = q }
 
-// SetPreEditHook installs the pre-edit snapshot hook (see onPreEdit). The
-// controller wires it to its per-session checkpoint store; nil disables capture.
+// SetPreEditHook 安装编辑前快照钩子（参见 onPreEdit）。
+// 控制器将其连接到其每会话的检查点存储；nil 禁用捕获。
 func (a *Agent) SetPreEditHook(fn func(diff.Change)) { a.onPreEdit = fn }
 
-// Session returns the agent's current conversation, useful for persistence
-// hooks that need to read the message log between turns. sessMu serialises this
-// pointer read against SetSession, so a frontend (serve's concurrent /history and
-// /new handlers) can't race the swap. The run loop touches a.session directly and
-// only swaps it via SetSession while idle, so its reads need no lock.
+// Session 返回代理的当前会话，对于需要在回合之间读取消息日志的持久化钩子很有用。
+// sessMu 将此指针读取与 SetSession 序列化，因此前端（serve 的并发 /history 和 /new 处理器）
+// 不会在交换时产生竞争。
+// 运行循环直接访问 a.session，只在空闲时通过 SetSession 交换，因此其读取不需要加锁。
 func (a *Agent) Session() *Session {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 	return a.session
 }
 
-// SetSession replaces the agent's conversation wholesale. Used by
-// `reasonix --resume` to load a saved JSONL transcript before the first turn,
-// so the model picks up exactly where it left off. Callers serialise it against a
-// running turn (it only fires while idle); sessMu guards the pointer swap itself.
+// SetSession 整体替换代理的会话。
+// 由 `reasonix --resume` 在第一个回合之前加载保存的 JSONL 转录文件，
+// 使模型从上次中断的地方继续。
+// 调用者将其与运行中的回合序列化（只在空闲时触发）；
+// sessMu 保护指针交换本身。
 func (a *Agent) SetSession(s *Session) {
 	a.sessMu.Lock()
 	a.session = s
 	a.sessMu.Unlock()
+	// 重置累积缓存统计
 	a.sessCacheHit.Store(0)
 	a.sessCacheMiss.Store(0)
 	if s != nil {
+		// 从会话消息中重建规范任务列表
 		a.rebuildTodoState(s.Snapshot())
 	}
 }
 
-// LastUsage returns the most recent per-turn token telemetry the provider
-// reported (nil if no turn has run yet). The TUI uses it to show a context
-// gauge alongside the prompt; the actual cache decisions still live inside
-// maybeCompact.
+// LastUsage 返回提供者报告的最近一次每回合 token 遥测数据（如果还没有回合运行则为 nil）。
+// TUI 使用它在提示旁边显示上下文仪表；实际的缓存决策仍然在 maybeCompact 中。
 func (a *Agent) LastUsage() *provider.Usage { return a.lastUsage.Load() }
 
-// SessionCache returns the cumulative cache hit/miss prompt tokens across every
-// API call this session — the basis for the status line's aggregate hit-rate.
+// SessionCache 返回本会话每次 API 调用的累积缓存命中/未命中提示 token 数——
+// 这是状态行聚合命中率的基础。
 func (a *Agent) SessionCache() (hit, miss int) {
 	return int(a.sessCacheHit.Load()), int(a.sessCacheMiss.Load())
 }
 
-// ContextWindow returns the configured context-window size in tokens. 0
-// means compaction is disabled for this agent.
+// ContextWindow 返回配置的上下文窗口大小（token 数）。
+// 0 表示此代理禁用了压缩。
 func (a *Agent) ContextWindow() int { return a.contextWindow }
 
-// mid-turn steer marker.
-// MidTurnSteerPrefix marks user messages that were injected mid-turn as
-// guidance (via Steer). The model sees them as instructions; frontends
-// display them as a notice, not a regular user bubble.
+// MidTurnSteerPrefix 是回合中途引导消息的标记前缀。
+// 通过 Steer 注入的用户消息以此前缀开头。
+// 模型将其视为指令；前端将其显示为通知，而非普通的用户消息气泡。
 const MidTurnSteerPrefix = "[Mid-turn steer queued by the user. Do not treat this as a new task; use it only as additional guidance for the current task after completing the current step.]"
 
+// midTurnSteerMessage 将用户文本包装为回合中途引导消息，添加前缀和分隔符。
 func midTurnSteerMessage(text string) string {
 	return MidTurnSteerPrefix + "\n" + text
 }
 
-// SteerText checks whether content is a mid-turn steer message and, if so,
-// returns the original user text without the wrapper prefix. The returned
-// text preserves the user's exact input — it only strips the prefix and the
-// "\n" separator that midTurnSteerMessage inserts between the prefix and the
-// user text; it does not trim spaces so the history replay matches the live
-// Steer event rendering character-for-character.
+// SteerText 检查内容是否为回合中途的引导消息，如果是，则返回不含包装前缀的原始用户文本。
+//
+// 返回的文本保留用户的精确输入——只去除前缀和 midTurnSteerMessage 在前缀与用户文本之间
+// 插入的 "\n" 分隔符；不修剪空格，以便历史重放与实时 Steer 事件渲染逐字符匹配。
 func SteerText(content string) (string, bool) {
 	after, found := strings.CutPrefix(content, MidTurnSteerPrefix)
 	if !found {
@@ -489,7 +522,8 @@ func SteerText(content string) (string, bool) {
 	return after, true
 }
 
-// Steer queues a message for mid-turn injection.
+// Steer 将消息排队用于回合中途注入。
+// 消息将在下一次循环迭代中被消费，持久化到会话，并作为指导发送给模型。
 func (a *Agent) Steer(text string) {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
@@ -497,13 +531,16 @@ func (a *Agent) Steer(text string) {
 	a.steerConsumed = false
 }
 
-// SteerConsumed returns true when the steer queue became empty after the last consume.
+// SteerConsumed 返回引导队列在上次消费后是否变为空。
+// 用于前端检测所有引导消息是否已被送达。
 func (a *Agent) SteerConsumed() bool {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
 	return a.steerConsumed
 }
 
+// consumeSteer 从引导队列中消费一条消息（FIFO）。
+// 返回消息内容和是否成功消费。队列为空时返回 false。
 func (a *Agent) consumeSteer() (string, bool) {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
@@ -516,6 +553,7 @@ func (a *Agent) consumeSteer() (string, bool) {
 	return t, true
 }
 
+// clearSteerQueue 清空引导队列，通常在回合结束时调用。
 func (a *Agent) clearSteerQueue() {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
@@ -523,69 +561,68 @@ func (a *Agent) clearSteerQueue() {
 	a.steerConsumed = false
 }
 
+// steerQueueLen 返回引导队列的当前长度。
 func (a *Agent) steerQueueLen() int {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
 	return len(a.steerQueue)
 }
 
-// CompactRatio returns the fraction of the window at which auto-compaction
-// fires (e.g. 0.8). The status line uses it to show headroom to the next compact.
+// CompactRatio 返回自动压缩触发的窗口比例（例如 0.8）。
+// 状态行使用它来显示距离下次压缩的剩余空间。
 func (a *Agent) CompactRatio() float64 { return a.compactRatio }
 
-// CompactNow runs one compaction pass immediately, regardless of the
-// usage-ratio threshold maybeCompact normally honours. Used by the chat
-// TUI's `/compact` command so the user can reset the prefix before it
-// naturally fills up.
+// CompactNow 立即运行一次压缩过程，无论使用率阈值如何。
+// 由聊天 TUI 的 `/compact` 命令使用，使用户可以在前缀自然填满之前重置它。
 func (a *Agent) CompactNow(ctx context.Context, instructions string) error {
 	return a.compact(ctx, "manual", instructions, true)
 }
 
-// Options configures an Agent.
+// Options 配置 Agent 的各项参数。
 type Options struct {
-	MaxSteps int
-	// MaxStepsKey names the configuration knob shown when the MaxSteps guard is
-	// hit. Empty defaults to agent.max_steps.
-	MaxStepsKey string
-	Temperature float64
-	Pricing     *provider.Pricing // optional, for per-turn cost display
-	UsageSource string            // optional billable usage source; default executor
+	MaxSteps    int    // 工具调用回合的最大步数（<=0 表示无限制）
+	MaxStepsKey string // 配置键名，达到上限时显示给用户（空值默认为 "agent.max_steps"）
 
-	// Gate is the per-call permission gate. nil disables gating.
+	Temperature float64          // 模型采样温度
+	Pricing     *provider.Pricing // 可选的定价信息，用于每回合成本显示
+	UsageSource string            // 可选的计费使用量来源；默认为 executor
+
+	// Gate 是每调用的权限门控。nil 禁用门控。
 	Gate Gate
 
-	// Context management. ContextWindow <= 0 disables compaction. Ratios and
-	// RecentKeep fall back to defaults when unset.
-	ContextWindow     int
-	SoftCompactRatio  float64
-	CompactRatio      float64
-	CompactForceRatio float64
-	RecentKeep        int
-	ArchiveDir        string
-	KeepPolicy        KeepPolicy
+	// ===== 上下文管理配置 =====
+	// ContextWindow <= 0 禁用压缩。比率和 RecentKeep 未设置时回退到默认值。
+	ContextWindow     int        // 上下文窗口大小（token 数）
+	SoftCompactRatio  float64    // 软压缩触发比率（默认 0.7）
+	CompactRatio      float64    // 自动压缩触发比率（默认 0.8）
+	CompactForceRatio float64    // 强制压缩触发比率（默认 0.95）
+	RecentKeep        int        // 压缩时保留的最近消息数
+	ArchiveDir        string     // 原始消息的归档目录
+	KeepPolicy        KeepPolicy // 压缩时保留消息的策略
 
-	// Hooks fires PreToolUse / PostToolUse shell hooks around tool calls. nil
-	// disables hook firing.
+	// Hooks 在工具调用前后触发 PreToolUse/PostToolUse shell 钩子。nil 禁用钩子。
 	Hooks ToolHooks
 
-	// Jobs is the session's background-job manager (nil disables background tools).
+	// Jobs 是会话的后台任务管理器（nil 禁用后台工具）。
 	Jobs *jobs.Manager
 
-	// ProjectChecks are host-observable structured checks extracted during boot.
+	// ProjectChecks 是启动期间提取的主机可观察的结构化检查。
 	ProjectChecks []instruction.VerifyCheck
 
-	// ReasoningLanguage controls visible reasoning language preference as transient
-	// user-turn context. Empty/auto injects nothing.
+	// ReasoningLanguage 控制可见推理语言偏好，作为临时的用户回合上下文。
+	// 空值或 "auto" 不注入任何内容。
 	ReasoningLanguage string
 
-	// PlanModeAllowedTools names tools that bypass the plan-mode read-only gate.
-	// When a tool named here is called while planMode is true, it executes
-	// without the "plan mode is read-only" block — even if its ReadOnly contract
-	// returns false. Use sparingly; the caller is responsible for ensuring the
-	// tool invocation is safe in a read-only context (e.g. bash for git status).
+	// PlanModeAllowedTools 列出绕过计划模式只读门控的工具名称。
+	// 当计划模式为 true 时，此处命名的工具将绕过"计划模式是只读的"阻止——
+	// 即使其 ReadOnly 契约返回 false。
+	// 谨慎使用；调用者负责确保工具调用在只读上下文中是安全的
+	// （例如 bash 用于 git status）。
 	PlanModeAllowedTools []string
 }
 
+// stringSet 将字符串切片转换为集合（map[string]bool）。
+// 空切片返回 nil，避免不必要的内存分配。
 func stringSet(ss []string) map[string]bool {
 	if len(ss) == 0 {
 		return nil
@@ -597,10 +634,18 @@ func stringSet(ss []string) map[string]bool {
 	return m
 }
 
-// New constructs an Agent. MaxSteps <= 0 means no cap — the run loop continues
-// until the model gives a final answer, the context is cancelled, or the
-// provider errors (compaction keeps the context bounded). A nil sink is replaced
-// with event.Discard so the agent can always emit unconditionally.
+// New 构造一个 Agent 实例。
+//
+// 参数说明：
+//   - prov: 模型提供者（如 OpenAI、DeepSeek 等）
+//   - tools: 工具注册表，管理所有可用工具
+//   - session: 会话实例，包含消息历史
+//   - opts: 配置选项（最大步数、温度、上下文窗口等）
+//   - sink: 事件接收器（nil 会被替换为 event.Discard）
+//
+// MaxSteps <= 0 表示无上限——运行循环持续到模型给出最终答案、
+// 上下文被取消或提供者出错（压缩机制保持上下文有界）。
+// nil sink 被替换为 event.Discard，使代理可以无条件地发射事件。
 func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Options, sink event.Sink) *Agent {
 	if opts.SoftCompactRatio <= 0 {
 		opts.SoftCompactRatio = defaultSoftCompactRatio
@@ -657,6 +702,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	return a
 }
 
+// usageSourceOrDefault 返回使用量来源，如果为空则返回默认值。
 func usageSourceOrDefault(source, fallback string) string {
 	source = strings.TrimSpace(source)
 	if source != "" {
@@ -665,37 +711,64 @@ func usageSourceOrDefault(source, fallback string) string {
 	return fallback
 }
 
-// Run appends the user input and drives the tool loop until the model returns a
-// final answer (no tool calls), the context is cancelled, or the provider errors.
-// With maxSteps <= 0 the loop is unbounded — the natural termination is the model
-// finishing, and the real safety bounds are user cancellation and compaction, not
-// a round count. A positive maxSteps imposes an optional hard guard, surfaced as
-// a resumable notice when hit.
+// Run 追加用户输入并驱动工具循环，直到模型返回最终答案（无工具调用）、
+// 上下文被取消或提供者出错。
+//
+// 核心循环逻辑：
+//  1. 发射 TurnStarted 事件，将用户输入添加到会话
+//  2. 进入主循环，每轮迭代：
+//     a. 消费排队的引导消息（steer）
+//     b. 调用 stream() 获取模型的流式响应
+//     c. 如果流中断且可恢复，追加恢复提示并重试
+//     d. 将助手消息添加到会话（包含推理内容和工具调用）
+//     e. 如果没有工具调用：进行就绪性检查，通过则返回
+//     f. 如果有工具调用：执行批次，将结果添加到会话，可能触发压缩
+//     g. 如果达到 maxSteps 上限，进入宽限期（grace round）
+//
+// 参数：
+//   - ctx: 上下文，用于取消控制
+//   - input: 用户的输入文本
+//
+// 返回值：错误信息，nil 表示正常完成。
 func (a *Agent) Run(ctx context.Context, input string) error {
+	// 清理引导队列：回合结束时清空，防止上一回合的引导消息泄漏到下一回合
 	defer a.clearSteerQueue()
 	a.steerMu.Lock()
 	a.steerConsumed = false
 	a.steerMu.Unlock()
+
+	// 重置每回合状态：证据账本和重复成功计数器
 	if a.evidence != nil {
 		a.evidence.Reset()
 	}
 	a.repeatSuccessCounts = nil
+
+	// 发射回合开始事件，通知前端重置渲染状态
 	a.sink.Emit(event.Event{Kind: event.TurnStarted})
+
+	// 注入推理语言偏好到用户输入中
 	input = a.withReasoningLanguage(input)
+
+	// 将用户消息添加到会话历史（包含可选的图片附件）
 	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input, Images: userImages(ctx)})
 
-	finalReadinessBlocks := 0
-	emptyFinalBlocks := 0
-	handoffNudges := 0
-	usedAnyTool := false
-	streamRecoveries := 0
-	graceRound := false
+	// ===== 回合级计数器 =====
+	finalReadinessBlocks := 0    // 最终就绪性检查失败次数
+	emptyFinalBlocks := 0        // 空最终答案次数
+	handoffNudges := 0           // 执行器交接提示次数
+	usedAnyTool := false         // 本回合是否使用过任何工具
+	streamRecoveries := 0        // 流恢复次数
+	graceRound := false          // 是否处于宽限期
 	executorHandoff := a.executorHandoffGuard && strings.Contains(input, executorHandoffMarker)
+
+	// ===== 主循环 =====
+	// maxSteps <= 0 时循环无界——自然终止是模型完成，
+	// 真正的安全边界是用户取消和压缩，而非回合计数。
+	// 正的 maxSteps 施加可选的硬防护，达到时显示可恢复的通知。
 	for step := 0; a.maxSteps <= 0 || step < a.maxSteps || graceRound; step++ {
-		// Consume a queued steer and persist it to the session so it
-		// survives tab switches and history replay. The model sees it as
-		// guidance (with a prefix), not a new task. One cache miss per
-		// steer is unavoidable — the model must see the new instruction.
+		// 消费排队的引导消息并持久化到会话，使其在标签切换和历史重放中存活。
+		// 模型将其视为指导（带前缀），而非新任务。
+		// 每次引导不可避免地导致一次缓存未命中——模型必须看到新指令。
 		if text, ok := a.consumeSteer(); ok {
 			a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withReasoningLanguage(midTurnSteerMessage(text))})
 			a.sink.Emit(event.Event{Kind: event.Steer, Text: text})
@@ -848,18 +921,19 @@ func (a *Agent) finalReadinessFailure() string {
 	return a.finalReadinessCheck().reason
 }
 
-// GoalReadinessFailure returns the final-readiness failure reason — a summary of
-// incomplete todos and unverified project checks — or empty string if none.
-// Exported so the Controller can gate [goal:complete] on evidence.
+// GoalReadinessFailure 返回最终就绪性失败原因——未完成的 todo 和未验证的项目检查的摘要——
+// 如果没有则返回空字符串。
+// 导出此方法以便控制器可以基于证据限制 [goal:complete]。
 func (a *Agent) GoalReadinessFailure() string {
 	return a.finalReadinessFailure()
 }
 
+// finalReadinessCheck 表示最终就绪性检查的结果。
 type finalReadinessCheck struct {
-	applies              bool
-	reason               string
-	missingProjectChecks int
-	incompleteTodos      int
+	applies              bool   // 检查是否适用（是否有需要检查的条件）
+	reason               string // 失败原因（空表示通过）
+	missingProjectChecks int    // 缺失的项目检查数量
+	incompleteTodos      int    // 未完成的 todo 数量
 }
 
 func (c finalReadinessCheck) audit(result evidence.ReadinessAuditResult, recovered bool) evidence.ReadinessAudit {
@@ -872,6 +946,13 @@ func (c finalReadinessCheck) audit(result evidence.ReadinessAuditResult, recover
 	}
 }
 
+// finalReadinessCheck 执行最终就绪性检查，确保代理在给出最终答案之前
+// 已完成所有必要的工作。
+//
+// 检查内容：
+//  1. 如果有 todo 列表且有未完成项，阻止最终答案
+//  2. 如果有项目检查且最近一次写入后未运行验证命令，阻止最终答案
+//  3. 如果有 todo_write 但没有 complete_step 的证据，检查是否需要验证
 func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 	if a.evidence == nil {
 		return finalReadinessCheck{}
@@ -920,6 +1001,8 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 	return out
 }
 
+// finalReadinessIncompleteTodos 生成未完成 todo 项的描述字符串。
+// 格式为 "todo 内容: 状态"，多个项用逗号分隔。
 func finalReadinessIncompleteTodos(items []evidence.TodoStepMatch) string {
 	parts := make([]string, 0, len(items))
 	for _, item := range items {
@@ -932,15 +1015,15 @@ func finalReadinessIncompleteTodos(items []evidence.TodoStepMatch) string {
 	return "latest successful todo_write still has incomplete items: " + strings.Join(parts, ", ")
 }
 
+// setTodoState 线程安全地设置规范任务列表。
 func (a *Agent) setTodoState(todos []evidence.TodoItem) {
 	a.todoMu.Lock()
 	a.todoState = append([]evidence.TodoItem(nil), todos...)
 	a.todoMu.Unlock()
 }
 
-// SeedTodoState initializes the canonical task list from a host-generated
-// starter list, such as an approved plan. A new host seed replaces stale state
-// from earlier work so complete_step matches the plan the UI just displayed.
+// SeedTodoState 从主机生成的初始列表（如已批准的计划）初始化规范任务列表。
+// 新的主机种子替换早期工作的陈旧状态，使 complete_step 与 UI 刚刚显示的计划匹配。
 func (a *Agent) SeedTodoState(todos []evidence.TodoItem) {
 	if len(todos) == 0 {
 		return
@@ -948,14 +1031,14 @@ func (a *Agent) SeedTodoState(todos []evidence.TodoItem) {
 	a.setTodoState(todos)
 }
 
-// ReplaceTodoState mirrors a host-generated todo list into the canonical state.
-// It is used when the host, rather than the model, owns the full state transition.
+// ReplaceTodoState 将主机生成的 todo 列表镜像到规范状态中。
+// 当主机（而非模型）拥有完整状态转换时使用。
 func (a *Agent) ReplaceTodoState(todos []evidence.TodoItem) {
 	a.setTodoState(todos)
 	a.recordTodoState(todos)
 }
 
-// CanonicalTodoState returns a copy of the host-reconstructed task list.
+// CanonicalTodoState 返回主机重建的任务列表的副本。
 func (a *Agent) CanonicalTodoState() []evidence.TodoItem {
 	a.todoMu.Lock()
 	defer a.todoMu.Unlock()
@@ -971,10 +1054,10 @@ func (a *Agent) incompleteCanonicalTodos() ([]evidence.TodoStepMatch, bool) {
 	return evidence.IncompleteTodos(a.todoState), true
 }
 
-// advanceCanonicalTodo flips the canonical todo matching a signed-off step to
-// completed (promoting the next pending item to in_progress) and emits a
-// synthetic todo_write so the task panel reflects it without the model
-// re-sending the whole list. No-op when nothing matches or it is already done.
+// advanceCanonicalTodo 将匹配已签出步骤的规范 todo 翻转为已完成
+// （将下一个待处理项提升为 in_progress），并发射一个合成的 todo_write 事件，
+// 以便任务面板反映此变更而无需模型重新发送整个列表。
+// 当没有匹配项或已完成时为空操作。
 func (a *Agent) advanceCanonicalTodo(step string) {
 	a.todoMu.Lock()
 	if len(a.todoState) == 0 {
@@ -994,11 +1077,10 @@ func (a *Agent) advanceCanonicalTodo(step string) {
 	a.emitTodoState(snapshot, m.Index)
 }
 
-// recordTodoState logs the host-advanced list as a synthetic todo_write receipt
-// so the per-turn final gate (which reads the ledger's latest todo_write) sees
-// the advance — the model no longer has to re-send a todo_write to mark the
-// completion. It bypasses the todo_write tool, so the completion-transition
-// guard never runs on it.
+// recordTodoState 将主机推进的列表记录为合成的 todo_write 回执，
+// 以便每回合的最终门控（读取账本的最新 todo_write）看到推进——
+// 模型不再需要重新发送 todo_write 来标记完成。
+// 它绕过 todo_write 工具，因此完成转换守卫永远不会对它运行。
 func (a *Agent) recordTodoState(todos []evidence.TodoItem) {
 	if a.evidence == nil {
 		return
@@ -1010,6 +1092,8 @@ func (a *Agent) recordTodoState(todos []evidence.TodoItem) {
 	a.evidence.Record(evidence.ReceiptFromToolCall("todo_write", json.RawMessage(args), true, true))
 }
 
+// promoteNextPendingTodo 将下一个待处理的 todo 项提升为进行中状态。
+// 如果已经有进行中的项，则不做任何操作。
 func promoteNextPendingTodo(todos []evidence.TodoItem) {
 	for _, t := range todos {
 		if canonicalTodoStatus(t.Status) == "in_progress" {
@@ -1024,6 +1108,8 @@ func promoteNextPendingTodo(todos []evidence.TodoItem) {
 	}
 }
 
+// canonicalTodoStatus 返回规范化的 todo 状态字符串。
+// 空字符串被视为 "pending"。
 func canonicalTodoStatus(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -1032,9 +1118,9 @@ func canonicalTodoStatus(s string) string {
 	return s
 }
 
-// emitTodoState emits a synthetic todo_write event so the frontend task panel
-// reflects a host-advanced completion without the model re-sending the list.
-// itemIndex is the 1-based position of the completed todo in the panel.
+// emitTodoState 发射一个合成的 todo_write 事件，以便前端任务面板反映主机推进的完成状态，
+// 而无需模型重新发送列表。
+// itemIndex 是已完成 todo 在面板中的 1-based 位置。
 func (a *Agent) emitTodoState(todos []evidence.TodoItem, itemIndex int) {
 	args, err := json.Marshal(map[string]any{"todos": todos})
 	if err != nil {
@@ -1047,11 +1133,11 @@ func (a *Agent) emitTodoState(todos []evidence.TodoItem, itemIndex int) {
 	a.sink.Emit(event.Event{Kind: event.ToolResult, Tool: t})
 }
 
-// rebuildTodoState reconstructs the canonical task list from a transcript: the
-// latest successful todo_write is the base, then every complete_step after it
-// advances an item. Deterministic from persisted messages, so it survives a
-// fresh load or a rewind (the truncated history yields the historical state).
-// Empty after compaction drops the todo_write — no worse than no canonical list.
+// rebuildTodoState 从转录文件重建规范任务列表：
+// 最近一次成功的 todo_write 作为基础，之后的每个 complete_step 推进一个项目。
+// 从持久化的消息中确定性地重建，因此可以承受全新加载或回退
+// （截断的历史产生历史状态）。
+// 压缩丢弃 todo_write 后为空——不会比没有规范列表更糟。
 func (a *Agent) rebuildTodoState(msgs []provider.Message) {
 	successful := successfulToolCallIDs(msgs)
 	var todos []evidence.TodoItem
@@ -1087,6 +1173,8 @@ func (a *Agent) rebuildTodoState(msgs []provider.Message) {
 	a.setTodoState(todos)
 }
 
+// successfulToolCallIDs 从消息历史中提取所有成功的工具调用 ID。
+// 用于 rebuildTodoState 以确定哪些工具调用是成功的。
 func successfulToolCallIDs(msgs []provider.Message) map[string]bool {
 	successful := map[string]bool{}
 	for _, msg := range msgs {
@@ -1100,6 +1188,8 @@ func successfulToolCallIDs(msgs []provider.Message) map[string]bool {
 	return successful
 }
 
+// toolResultFailed 检查工具结果内容是否表示失败。
+// 失败的标志：以 "error:", "blocked:", "Error:", "[error" 开头。
 func toolResultFailed(content string) bool {
 	content = strings.TrimSpace(content)
 	return strings.HasPrefix(content, "error:") ||
@@ -1108,6 +1198,8 @@ func toolResultFailed(content string) bool {
 		strings.HasPrefix(content, "[error")
 }
 
+// finalReadinessCheckSource 返回项目检查的来源描述。
+// 优先使用 SourcePath，否则使用 "project memory"；如果有行号则附加。
 func finalReadinessCheckSource(check instruction.VerifyCheck) string {
 	source := strings.TrimSpace(check.SourcePath)
 	if source == "" {
@@ -1119,14 +1211,24 @@ func finalReadinessCheckSource(check instruction.VerifyCheck) string {
 	return source
 }
 
+// finalReadinessRetryMessage 生成最终就绪性检查失败的重试提示消息。
+// 指示模型在给出最终答案之前解决缺失的主机可观察回执。
 func finalReadinessRetryMessage(reason string) string {
 	return "Host final-answer readiness check failed. Before giving a final answer, address the missing host-observable receipts: " + reason + ". Run the required tool calls, then answer when readiness is satisfied."
 }
 
+// shouldNudgeExecutorHandoff 判断是否应该提示执行器使用工具。
+// 如果执行器的纯文本回答是合理的（例如任务本身就是文本输出），则不提示。
 func shouldNudgeExecutorHandoff(input, answer string) bool {
 	return !executorHandoffAllowsTextOnly(input, answer)
 }
 
+// executorHandoffAllowsTextOnly 判断执行器的纯文本回答是否合理。
+// 检查逻辑：
+//  1. 如果回答看起来像延迟/推辞（如"好的"、"没问题"），不允许
+//  2. 解析执行器交接消息，提取任务和计划
+//  3. 如果任务本身是纯文本类型（如"总结"、"解释"），允许
+//  4. 如果计划是纯文本类型（如"告诉用户"、"无需工具"），允许
 func executorHandoffAllowsTextOnly(input, answer string) bool {
 	if looksLikeExecutorHandoffDeferral(answer) {
 		return false
@@ -1141,6 +1243,17 @@ func executorHandoffAllowsTextOnly(input, answer string) bool {
 	return handoffPlanLooksTextOnly(plan)
 }
 
+// parseExecutorHandoff 解析执行器交接消息，提取原始任务和规划器输出。
+// 消息格式：
+//
+//	# <executorHandoffMarker>
+//	...
+//	Original task:
+//	<task>
+//	Planner output:
+//	<plan>
+//	Executor instructions:
+//	...
 func parseExecutorHandoff(input string) (task, plan string, ok bool) {
 	input = StripTransientUserBlocks(input)
 	marker := "# " + executorHandoffMarker
@@ -1167,6 +1280,11 @@ func parseExecutorHandoff(input string) (task, plan string, ok bool) {
 	return strings.TrimSpace(task), strings.TrimSpace(plan), true
 }
 
+// looksLikeExecutorHandoffDeferral 判断执行器的回答是否看起来像延迟/推辞。
+// 延迟回答包括：
+//   - 空回答
+//   - 包含延迟短语的回答（如"计划看起来不错"、"我可以实现"）
+//   - 简短的确认回答（如"ok"、"好的"、"没问题"）
 func looksLikeExecutorHandoffDeferral(answer string) bool {
 	lower := strings.ToLower(strings.TrimSpace(answer))
 	if lower == "" {
@@ -1183,6 +1301,9 @@ func looksLikeExecutorHandoffDeferral(answer string) bool {
 	}
 }
 
+// handoffTaskLooksTextOnly 判断任务描述是否看起来是纯文本类型。
+// 如果任务包含工作请求术语（如"实现"、"修复"、"编辑"），则不是纯文本。
+// 如果任务包含纯文本术语（如"总结"、"解释"、"怎么办"），则是纯文本。
 func handoffTaskLooksTextOnly(task string) bool {
 	lower := strings.ToLower(strings.TrimSpace(task))
 	if lower == "" {
@@ -1194,6 +1315,10 @@ func handoffTaskLooksTextOnly(task string) bool {
 	return containsAnySubstring(lower, executorHandoffTextOnlyTaskTerms)
 }
 
+// handoffPlanLooksTextOnly 判断计划描述是否看起来是纯文本类型。
+// 如果计划包含本地操作术语（如"write_file"、"bash"、"文件"），则不是纯文本。
+// 如果计划包含纯文本术语（如"告诉用户"、"总结"、"无需工具"），则是纯文本。
+// 如果计划包含问号（?），也视为纯文本（向用户提问）。
 func handoffPlanLooksTextOnly(plan string) bool {
 	lower := strings.ToLower(strings.TrimSpace(plan))
 	if lower == "" {
@@ -1208,6 +1333,7 @@ func handoffPlanLooksTextOnly(plan string) bool {
 	return strings.Contains(lower, "?")
 }
 
+// containsAnySubstring 检查字符串 s 是否包含 terms 中的任何一个子串。
 func containsAnySubstring(s string, terms []string) bool {
 	for _, term := range terms {
 		if strings.Contains(s, term) {
@@ -1217,6 +1343,8 @@ func containsAnySubstring(s string, terms []string) bool {
 	return false
 }
 
+// executorHandoffDeferralPhrases 是执行器延迟/推辞回答的短语列表。
+// 包含中英文的各种确认和延迟表达。
 var executorHandoffDeferralPhrases = []string{
 	"plan looks", "looks good", "should be easy", "should be straightforward",
 	"i can implement", "i'll implement", "i will implement", "i'll get started",
@@ -1224,18 +1352,24 @@ var executorHandoffDeferralPhrases = []string{
 	"计划看起来", "可以实现", "我会", "我将", "接下来我", "马上开始",
 }
 
+// executorHandoffWorkRequestTerms 是工作请求术语列表。
+// 如果任务包含这些术语，说明需要实际的工具操作而非纯文本回答。
 var executorHandoffWorkRequestTerms = []string{
 	"implement", "fix", "refactor", "migrate", "edit", "write", "create", "delete",
 	"update", "remove", "add ", "test", "build", "repair", "patch",
 	"修改", "修复", "实现", "新增", "重构", "迁移", "补齐", "更新", "删除", "移除",
 }
 
+// executorHandoffTextOnlyTaskTerms 是纯文本任务术语列表。
+// 如果任务包含这些术语，说明纯文本回答是合理的。
 var executorHandoffTextOnlyTaskTerms = []string{
 	"now what", "what next", "tl;dr", "tldr", "summarize", "summary", "explain",
 	"i installed", "i just installed", "i turned on", "i enabled", "it's on", "it is on",
 	"怎么办", "下一步", "然后呢", "总结", "解释", "说明", "装了", "装好了", "安装了", "开了", "开启了", "打开了",
 }
 
+// executorHandoffLocalActionTerms 是本地操作术语列表。
+// 如果计划包含这些术语，说明需要实际的工具操作而非纯文本回答。
 var executorHandoffLocalActionTerms = []string{
 	"write_file", "read_file", "apply_patch", "bash",
 	"workspace", "repo", "repository", "codebase", "file", "path",
@@ -1244,6 +1378,8 @@ var executorHandoffLocalActionTerms = []string{
 	"文件", "路径", "仓库", "代码", "写入", "编辑", "修改", "创建", "删除", "移除", "更新", "新增", "运行", "命令", "测试", "构建",
 }
 
+// executorHandoffTextOnlyPlanTerms 是纯文本计划术语列表。
+// 如果计划包含这些术语，说明纯文本回答是合理的。
 var executorHandoffTextOnlyPlanTerms = []string{
 	"tell the user", "ask the user", "guide the user", "explain to the user",
 	"summarize", "summary", "tl;dr", "tldr", "answer the user", "respond to the user",
@@ -1255,6 +1391,8 @@ var executorHandoffTextOnlyPlanTerms = []string{
 	"手动", "无需工具", "不需要工具", "试听", "听歌", "对比", "勾选",
 }
 
+// executorHandoffRetryMessage 生成执行器交接重试的提示消息。
+// 当执行器在没有使用任何工具的情况下给出答案时，提示它使用工具执行任务。
 func executorHandoffRetryMessage() string {
 	return `You are already in the executor phase. The planner's read-only limitations do not apply to you.
 
@@ -1264,14 +1402,20 @@ Do not answer as the planner and do not ask how to trigger the executor.
 Use your available tools now to carry out the task. If a write or command is blocked by permissions or workspace boundaries, state that specific blocker and ask for the needed approval/path.`
 }
 
+// hasVisibleFinalAnswer 检查模型的响应是否包含可见的最终答案文本。
+// 空白字符串被视为没有可见答案（模型可能只输出了推理而没有回答）。
 func hasVisibleFinalAnswer(text string) bool {
 	return strings.TrimSpace(text) != ""
 }
 
+// emptyFinalRetryMessage 生成空最终答案重试的提示消息。
+// 当模型给出空的最终答案（只有推理没有回答文本）时，提示它继续并提供可见的答案。
 func emptyFinalRetryMessage() string {
 	return "The previous assistant response finished without any visible answer text. Continue the same task now and provide a concise visible answer to the user. Do not send reasoning only."
 }
 
+// emptyFinalNotice 生成空最终答案的通知消息。
+// 包含提供者名称、完成原因和推理长度等诊断信息。
 func emptyFinalNotice(prov string, u *provider.Usage, reasoningLen int) string {
 	finish := "unknown"
 	if u != nil && u.FinishReason != "" {
@@ -1280,6 +1424,12 @@ func emptyFinalNotice(prov string, u *provider.Usage, reasoningLen int) string {
 	return fmt.Sprintf("empty final answer blocked: %s returned no visible answer text (finish=%s, reasoning=%d chars); retrying", prov, finish, reasoningLen)
 }
 
+// streamRecoveryMessage 生成流中断恢复的提示消息。
+//
+// 根据中断时的状态生成不同的恢复指令：
+//   - hadPartialTool: 工具调用正在流式传输时中断——指示模型从头发出新的完整工具调用
+//   - hasPartialText: 有部分回答文本——指示模型从中断处继续，不重复已有文本
+//   - 默认: 在可见答案文本完成之前中断——指示模型提供下一个有用的响应
 func streamRecoveryMessage(hasPartialText, hadPartialTool bool) string {
 	switch {
 	case hadPartialTool:
@@ -1291,39 +1441,67 @@ func streamRecoveryMessage(hasPartialText, hadPartialTool bool) string {
 	}
 }
 
-// stream runs one completion, emitting reasoning and text deltas as typed
-// events and collecting complete tool calls. A Message event closes the text
-// stream so a sink can re-render the streamed raw text as styled markdown. The
-// accumulated text and reasoning are also returned so the caller can round-trip
-// reasoning on the next turn.
+// stream 执行一次模型补全（completion），将推理和文本增量作为类型化事件发射，
+// 并收集完整的工具调用。
+//
+// 流式处理流程：
+//  1. 调用 Provider.Stream() 获取流式 Chunk 通道
+//  2. 遍历 Chunk，按类型处理：
+//     - ChunkReasoning: 累积推理文本，实时发射 Reasoning 事件（除非有 PostLLMCall 钩子）
+//     - ChunkText: 累积回答文本，实时发射 Text 事件
+//     - ChunkToolCallStart: 发射部分 ToolDispatch 事件（ID/Name 已知，Args 仍在流式传输）
+//     - ChunkToolCall: 收集完整的工具调用
+//     - ChunkUsage: 记录 token 使用量，更新缓存统计
+//     - ChunkError: 处理错误，区分可恢复的流中断和不可恢复的错误
+//  3. 流完成后，如果有 PostLLMCall 钩子，转换并发射完整的推理文本
+//  4. 发射 Message 事件关闭文本流，让 Sink 可以重新渲染为带样式的 Markdown
+//
+// 返回值：
+//   - text: 累积的回答文本
+//   - reasoning: 累积的推理文本（可能经过 PostLLMCall 钩子转换）
+//   - signature: 提供者签发的推理证明（Anthropic thinking 模式）
+//   - calls: 完整的工具调用列表
+//   - usage: token 使用量数据
+//   - interrupted: 流是否被中断（可恢复）
+//   - partialToolStarted: 是否有工具调用已开始流式传输
+//   - err: 错误信息
 func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, []provider.ToolCall, *provider.Usage, bool, bool, error) {
+	// 注入重试通知回调：当提供者因瞬态失败重试时，发射 Retrying 事件通知前端
 	ctx = provider.WithRetryNotify(ctx, func(info provider.RetryInfo) {
 		a.sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: info.Attempt, RetryMax: info.Max})
 	})
+
+	// 调用提供者的流式 API，获取 Chunk 通道
 	ch, err := a.prov.Stream(ctx, provider.Request{
-		Messages:    a.session.Messages,
-		Tools:       a.tools.Schemas(),
-		Temperature: a.temperature,
+		Messages:    a.session.Messages, // 完整的消息历史
+		Tools:       a.tools.Schemas(),  // 工具模式列表
+		Temperature: a.temperature,      // 采样温度
 	})
 	if err != nil {
 		return "", "", "", nil, nil, false, false, err
 	}
 
-	// A PostLLMCall hook rewrites the whole reasoning block, so when one is wired
-	// up we buffer reasoning silently and emit the transformed text once after the
-	// stream. With no such hook the reasoning streams live, chunk by chunk, as
-	// before — the common case must not lose its live "thinking…" display.
+	// PostLLMCall 钩子会重写整个推理块，因此当钩子存在时，
+	// 我们静默缓冲推理文本，在流完成后一次性发射转换后的文本。
+	// 没有钩子时，推理按块实时流式传输——常见情况不能丢失实时的"思考中..."显示。
 	transformReasoning := a.hooks != nil && a.hooks.HasPostLLMCall()
 
-	var text, reasoning strings.Builder
-	var signature string // provider-issued proof for the reasoning (Anthropic thinking)
-	var calls []provider.ToolCall
-	var usage *provider.Usage
-	var partialToolStarted bool
+	// ===== 累积器 =====
+	var text, reasoning strings.Builder // 回答文本和推理文本的累积器
+	var signature string                // 提供者签发的推理证明（Anthropic thinking 模式）
+	var calls []provider.ToolCall       // 收集的完整工具调用
+	var usage *provider.Usage           // token 使用量数据
+	var partialToolStarted bool         // 是否有工具调用已开始流式传输
+
+	// finishReasoning 完成推理文本的处理：
+	// 如果有 PostLLMCall 钩子，转换推理文本并发射；
+	// 如果有签名（Anthropic thinking），存储原始文本以便重放验证。
+	// 返回值：stored（存储的文本）、display（显示的文本）
 	finishReasoning := func() (stored, display string) {
 		original := reasoning.String()
 		display = original
 		if transformReasoning && original != "" {
+			// 通过钩子转换推理文本（如翻译、摘要等）
 			display = a.hooks.PostLLMCall(ctx, original, turn)
 			if display != "" {
 				a.sink.Emit(event.Event{Kind: event.Reasoning, Text: display})
@@ -1331,73 +1509,95 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		}
 		stored = display
 		if signature != "" {
+			// 有签名时存储原始文本，因为签名验证要求原始内容不变
 			stored = original
 		}
 		return stored, display
 	}
+
+	// ===== 流式 Chunk 处理循环 =====
+	// 这是流式处理的核心：逐块消费模型输出，实时发射事件
 	for chunk := range ch {
 		switch chunk.Type {
 		case provider.ChunkReasoning:
+			// 推理增量：累积到 reasoning 缓冲区
 			reasoning.WriteString(chunk.Text)
 			if chunk.Signature != "" {
-				signature = chunk.Signature
+				signature = chunk.Signature // 捕获提供者的签名
 			}
+			// 没有 PostLLMCall 钩子时，实时发射推理增量
 			if chunk.Text != "" && !transformReasoning {
 				a.sink.Emit(event.Event{Kind: event.Reasoning, Text: chunk.Text})
 			}
+
 		case provider.ChunkText:
+			// 回答文本增量：累积并实时发射
 			text.WriteString(chunk.Text)
 			a.sink.Emit(event.Event{Kind: event.Text, Text: chunk.Text})
+
 		case provider.ChunkToolCallStart:
+			// 工具调用开始：标记部分工具已开始，发射早期的 ToolDispatch 事件
 			partialToolStarted = true
-			// Surface the tool card as soon as the call begins — before its
-			// (possibly large) arguments finish streaming — so the user sees it
-			// working instead of a stall. executeBatch emits the full dispatch
-			// (with args) once the call completes; the frontend merges by ID.
+			// 在调用开始时立即显示工具卡片——在其（可能很大的）参数流式传输完成之前——
+			// 这样用户看到的是正在工作而非卡顿。
+			// executeBatch 在调用完成后发射完整的分派（带参数）；前端通过 ID 合并。
 			if tc := chunk.ToolCall; tc != nil {
 				a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
 					ID: tc.ID, Name: tc.Name, ReadOnly: a.toolReadOnly(tc.Name), Partial: true,
 				}})
 			}
+
 		case provider.ChunkToolCall:
+			// 完整的工具调用：收集到 calls 列表中
 			partialToolStarted = true
 			calls = append(calls, *chunk.ToolCall)
+
 		case provider.ChunkUsage:
+			// token 使用量：记录并更新缓存统计
 			usage = chunk.Usage
 			a.lastUsage.Store(chunk.Usage)
 			a.sessCacheHit.Add(int64(chunk.Usage.CacheHitTokens))
 			a.sessCacheMiss.Add(int64(chunk.Usage.CacheMissTokens))
+
 		case provider.ChunkError:
+			// 错误处理：区分可恢复的流中断和不可恢复的错误
 			if provider.IsStreamInterrupted(chunk.Err) {
+				// 流中断：完成推理处理，返回已收集的内容，标记为可中断
 				stored, _ := finishReasoning()
 				return text.String(), stored, signature, calls, usage, true, partialToolStarted, chunk.Err
 			}
+			// 不可恢复的错误：直接返回
 			return "", "", "", nil, nil, false, false, chunk.Err
 		}
 	}
-	// With a PostLLMCall hook, the live stream was suppressed above; transform the
-	// full reasoning now and emit it once so the sink never sees the untranslated
-	// text. Without a hook this is skipped — the chunk-by-chunk events already fired.
+	// ===== 流完成后的处理 =====
+
+	// 如果有 PostLLMCall 钩子，上面的实时流被抑制了；
+	// 现在转换完整的推理文本并一次性发射，使 Sink 永远看不到未翻译的文本。
+	// 没有钩子时跳过此步骤——逐块事件已经发射过了。
 	stored, display := finishReasoning()
-	// Store the transformed reasoning — except when a provider signature pins it to
-	// the original text (Anthropic extended thinking). That signed thinking block is
-	// replayed verbatim on the next tool-call turn; re-uploading transformed text
-	// under the original signature is rejected, so keep the original for storage
-	// while the user still sees the transformed version live. finishReasoning did
-	// that choice above.
-	// Close the text stream: a sink may re-render the streamed raw text as
-	// styled markdown now that it is complete. Reasoning rides along so the sink
-	// has the full chain if it wants it.
+
+	// 存储转换后的推理文本——除了当提供者签名将其固定到原始文本时
+	// （Anthropic 扩展思维模式）。那个签名的思维块会在下一个工具调用回合
+	// 原样重放；在原始签名下重新上传转换后的文本会被拒绝，
+	// 因此存储原始文本，而用户仍然看到转换后的版本实时显示。
+	// finishReasoning 已经在上面做出了这个选择。
+
+	// 关闭文本流：Sink 现在可以将流式传输的原始文本重新渲染为带样式的 Markdown。
+	// 推理文本也一起传递，以便 Sink 在需要时拥有完整的推理链。
 	if text.Len() > 0 || display != "" {
 		a.sink.Emit(event.Event{Kind: event.Message, Text: StripGoalMarkers(text.String()), Reasoning: display})
 	}
 	return text.String(), stored, signature, calls, usage, false, false, nil
 }
 
+// capturePrefixShape 捕获当前请求的可缓存前缀形状，用于缓存流失归因。
 func (a *Agent) capturePrefixShape(schemas []provider.ToolSchema) PrefixShape {
 	return CaptureShape(a.systemPrompt(), schemas, a.session.RewriteVersion())
 }
 
+// systemPrompt 从会话消息中提取系统提示文本。
+// 如果有多个系统消息，用换行符连接。
 func (a *Agent) systemPrompt() string {
 	var b strings.Builder
 	for _, m := range a.session.Messages {
@@ -1412,23 +1612,35 @@ func (a *Agent) systemPrompt() string {
 	return b.String()
 }
 
-// executeBatch dispatches one model turn's tool calls. A ToolDispatch event is
-// emitted for every call up front, in call order, so a frontend can show the
-// timeline chronologically. Contiguous known ReadOnly calls fan out across
-// goroutines; unknown and writer calls run as single-call serial segments so
-// write/read ordering stays provider-ordered. ToolResult events are emitted
-// after the batch in call order, so emission stays serial even when execution
-// parallelised.
+// executeBatch 分派一个模型回合中的所有工具调用。
+//
+// 执行策略：
+//  1. 首先为每个调用发射 ToolDispatch 事件（按调用顺序），以便前端按时间线展示
+//  2. 将连续的已知只读调用分组为可并行批次（最多 8 个 goroutine）
+//  3. 未知工具和写入工具作为单调用串行段运行，保持写入/读取顺序与提供者一致
+//  4. 所有调用完成后，按调用顺序发射 ToolResult 事件（即使执行是并行的）
+//
+// 参数：
+//   - ctx: 上下文，用于取消控制
+//   - calls: 工具调用列表
+//
+// 返回值：每个调用的结果字符串数组（与 calls 一一对应）
 func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []string {
+	// ===== 第一阶段：发射所有 ToolDispatch 事件 =====
+	// 按调用顺序预先发射，以便前端可以按时间线展示
 	for _, c := range calls {
 		t, ok := a.tools.Get(c.Name)
 		ev := event.Tool{ID: c.ID, Name: c.Name, Args: c.Arguments, ReadOnly: ok && t.ReadOnly()}
 		ev.FileDiff = event.FileDiff{Diff: c.Diff, Added: c.Added, Removed: c.Removed}
+
+		// 如果提供者没有附带差异预览，尝试通过工具的 PreviewChange 接口生成
 		if ok && ev.Diff == "" && ev.Added == 0 && ev.Removed == 0 {
 			if ch, ok := tool.PreviewChange(t, json.RawMessage(c.Arguments)); ok {
 				ev.FileDiff = event.FileDiff{Diff: ch.Diff, Added: ch.Added, Removed: ch.Removed}
 			}
 		}
+
+		// 解析子代理配置文件（task/skill 调用时）
 		if ok {
 			if pr, ok := t.(interface {
 				ResolveProfile(json.RawMessage) *event.Profile
@@ -1439,16 +1651,21 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 		a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: ev})
 	}
 
+	// ===== 第二阶段：执行工具调用 =====
 	results := make([]string, len(calls))
 	outcomes := make([]toolOutcome, len(calls))
 	durations := make([]int64, len(calls))
+
+	// run 是单个工具调用的执行包装器，记录执行时间和结果
 	run := func(i int) {
 		start := time.Now()
 		outcomes[i] = a.executeOne(ctx, calls[i])
 		durations[i] = time.Since(start).Milliseconds()
 		results[i] = outcomes[i].output
 	}
+
 	cancelled := false
+	// markCancelled 将从 start 开始的所有未执行调用标记为已取消
 	markCancelled := func(start int) {
 		errMsg := context.Canceled.Error()
 		if err := ctx.Err(); err != nil {
@@ -1462,34 +1679,34 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 		cancelled = true
 	}
 
+	// 按批次执行：只读工具可并行（最多 8 个），写入工具串行
 	for _, batch := range partitionToolCalls(a.tools, calls) {
+		// 在开始新批次前检查上下文是否已取消
 		if ctx.Err() != nil {
 			markCancelled(batch.start)
 			break
 		}
+
 		if batch.parallel && batch.end-batch.start > 1 {
+			// 并行批次：多个只读工具同时执行
 			ranUntil := runParallel(ctx, batch.start, batch.end, run)
-			// After parallel execution completes, check if context was cancelled.
-			// The individual tool executions should have detected ctx.Done(), but
-			// we verify here to ensure we don't continue to subsequent batches.
+			// 并行执行完成后，再次检查上下文是否已取消
 			if ctx.Err() != nil {
 				markCancelled(ranUntil)
 				break
 			}
 			continue
 		}
+
+		// 串行批次：逐个执行
 		for i := batch.start; i < batch.end; i++ {
-			// Before executing the next tool, check if context was cancelled.
-			// This prevents starting new tools when a previous tool's execution
-			// triggered cancellation.
+			// 在执行下一个工具前检查上下文是否已取消
 			if ctx.Err() != nil {
 				markCancelled(i)
 				break
 			}
 			run(i)
-			// After each tool execution, also check if the context was cancelled.
-			// If so, stop executing remaining tools and return immediately so
-			// the agent loop can detect the cancellation and exit.
+			// 每个工具执行后也检查上下文是否已取消
 			if ctx.Err() != nil {
 				markCancelled(i + 1)
 				break
@@ -1500,6 +1717,8 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 		}
 	}
 
+	// ===== 第三阶段：发射所有 ToolResult 事件 =====
+	// 按调用顺序发射，保持事件发射的串行性
 	for i, c := range calls {
 		o := outcomes[i]
 		t, ok := a.tools.Get(c.Name)
@@ -1513,16 +1732,22 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 			Truncated:  o.truncated,
 			DurationMs: durations[i],
 		}})
+		// 如果输出被截断，发射额外的通知事件
 		if o.truncated && o.truncMsg != "" {
 			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: o.truncMsg})
 		}
 	}
+
+	// 应用风暴断路器：检测重复失败的死循环
 	if !cancelled {
 		a.applyStormBreaker(calls, outcomes, results)
 	}
 	return results
 }
 
+// withPreviewFileDiffs 为工具调用列表中的写入工具生成文件差异预览。
+// 如果提供者没有附带差异预览，尝试通过工具的 PreviewChange 接口生成。
+// 返回带有填充了 Diff/Added/Removed 的工具调用列表。
 func (a *Agent) withPreviewFileDiffs(calls []provider.ToolCall) []provider.ToolCall {
 	if len(calls) == 0 {
 		return calls
@@ -1546,18 +1771,24 @@ func (a *Agent) withPreviewFileDiffs(calls []provider.ToolCall) []provider.ToolC
 	return out
 }
 
+// toolCallBatch 表示一个工具调用批次。
+// start 和 end 定义了在 calls 列表中的范围 [start, end)。
+// parallel 标记该批次是否可以并行执行（只读工具）。
 type toolCallBatch struct {
-	start    int
-	end      int
-	parallel bool
+	start    int  // 批次的起始索引（包含）
+	end      int  // 批次的结束索引（不包含）
+	parallel bool // 是否可并行执行
 }
 
-// partitionToolCalls keeps provider order while letting contiguous known
-// read-only tools run together. Unknown and writer tools are single-call serial
-// batches so they cannot reorder around reads or produce surprising errors.
-// complete_step and todo_write are read-only but never join a parallel run: they
-// read the turn's evidence ledger, so every prior call's receipt must be recorded
-// before they run.
+// partitionToolCalls 在保持提供者顺序的同时，让连续的已知只读工具可以一起运行。
+//
+// 分区策略：
+//   - 连续的只读工具 → 一个并行批次（parallel=true）
+//   - 未知工具或写入工具 → 单调用串行批次
+//   - complete_step 和 todo_write 虽然是只读的，但不参与并行运行：
+//     它们读取回合的证据账本，因此每个先前调用的回执必须在它们运行之前被记录
+//
+// 这种设计确保写入/读取顺序与提供者一致，同时最大化只读工具的并行度。
 func partitionToolCalls(r *tool.Registry, calls []provider.ToolCall) []toolCallBatch {
 	var batches []toolCallBatch
 	for i := 0; i < len(calls); {
@@ -1576,6 +1807,13 @@ func partitionToolCalls(r *tool.Registry, calls []provider.ToolCall) []toolCallB
 	return batches
 }
 
+// parallelisable 判断一个工具调用是否可以参与并行执行。
+//
+// 并行条件：
+//   - 工具必须存在于注册表中
+//   - 工具必须是只读的（ReadOnly() 返回 true）
+//   - 工具不能是 complete_step 或 todo_write（它们需要读取证据账本，
+//     必须在所有先前调用完成后才能运行）
 func parallelisable(r *tool.Registry, name string) bool {
 	if name == "complete_step" || name == "todo_write" {
 		return false
@@ -1584,63 +1822,71 @@ func parallelisable(r *tool.Registry, name string) bool {
 	return ok && t.ReadOnly()
 }
 
+// runParallel 并行执行从 start 到 end 的工具调用，最多使用 8 个 goroutine。
+//
+// 使用信号量（semaphore）模式控制并发度：
+//   - 创建容量为 maxParallel 的 channel 作为信号量
+//   - 每个 goroutine 启动前获取信号量，完成后释放
+//   - 支持上下文取消：如果 ctx 被取消，停止启动新的 goroutine
+//
+// 返回值：实际执行到的索引位置（用于取消时标记未执行的调用）。
 func runParallel(ctx context.Context, start, end int, run func(int)) int {
-	const maxParallel = 8
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
-	ranUntil := start
+	const maxParallel = 8                              // 最大并行度
+	sem := make(chan struct{}, maxParallel)             // 信号量 channel
+	var wg sync.WaitGroup                              // 等待组，用于等待所有 goroutine 完成
+	ranUntil := start                                  // 记录实际执行到的位置
 launch:
 	for i := start; i < end; i++ {
 		if ctx.Err() != nil {
 			break
 		}
 		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
+		case sem <- struct{}{}: // 获取信号量
+		case <-ctx.Done(): // 上下文已取消
 			break launch
 		}
 		if ctx.Err() != nil {
-			<-sem
+			<-sem // 释放信号量
 			break
 		}
-		i := i
+		i := i // 捕获循环变量
 		wg.Add(1)
 		ranUntil = i + 1
 		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			run(i)
+			defer wg.Done()              // 完成时减少等待计数
+			defer func() { <-sem }()     // 完成时释放信号量
+			run(i)                       // 执行工具调用
 		}()
 	}
-	wg.Wait()
+	wg.Wait() // 等待所有 goroutine 完成
 	return ranUntil
 }
 
-// stormBreakThreshold is how many times in a row the same tool may fail the same
-// way before the loop stops echoing the raw error back and instead returns a
-// directive to change approach. Two natural self-corrections are healthy; the
-// third identical failure is a death-spiral — the dominant case being a tool call
-// whose arguments are truncated at the output-token ceiling, which the model then
-// re-emits (re-worded but still over-long), truncating the same way again.
+// stormBreakThreshold 是相同工具以相同方式连续失败多少次后，
+// 循环停止回显原始错误并返回改变方法的指令。
+// 两次自然的自我纠正是健康的；第三次相同的失败是死亡螺旋——
+// 主要情况是工具调用的参数在输出 token 上限处被截断，
+// 然后模型重新发出（重新措辞但仍然过长），再次以相同方式截断。
 const stormBreakThreshold = 3
 
-// repeatSuccessBreakThreshold is how many identical write-like successes the
-// agent allows before refusing another copy in the same user turn. Two gives the
-// model room for a natural self-correction; the third repeat is usually a
-// no-op/write loop and should be redirected to a different tool or final answer.
+// repeatSuccessBreakThreshold 是代理在拒绝同一用户回合中的另一次复制之前
+// 允许的相同写入类成功次数。两次给模型留出自然自我纠正的空间；
+// 第三次重复通常是无操作/写入循环，应重定向到不同的工具或最终答案。
 const repeatSuccessBreakThreshold = 2
 
-// applyStormBreaker detects a run of identically-failing turns and, past the
-// threshold, rewrites the model-facing result (results[0]) into a directive to
-// change approach. It keys on each call's (tool, error) — not its args — because a
-// stuck model reworks the arguments cosmetically while failing identically (see
-// the stormSig field doc). A turn is a fixation candidate only when every one of
-// its calls errored and none was merely blocked by plan mode / permissions (those
-// carry a clear, distinct message the model can already act on). Any success, any
-// block, or a different batch shape is varied work, so it resets the counter. This
-// covers both the single-call spiral and a repeated multi-call batch. The hard
-// maxSteps guard remains the ultimate backstop; this just keeps the loop from
-// burning that whole budget bouncing off the same failure.
+// applyStormBreaker 检测连续以相同方式失败的回合，并在超过阈值后将
+// 面向模型的结果（results[0]）重写为改变方法的指令。
+//
+// 风暴断路器的工作原理：
+//   - 基于每个调用的 (tool, error) 而非 args 来键控——因为卡住的模型会对参数
+//     进行表面修改（重新措辞、重新排序）而每次都以相同方式失败
+//   - 一个回合是"固执"候选者，仅当它的每个调用都出错且没有一个被计划模式/权限阻止
+//     （那些携带了模型可以自行处理的清晰、独特的消息）
+//   - 任何成功、任何阻止或不同的批次形状都是多样化的工作，因此重置计数器
+//
+// 这涵盖了单调用螺旋和重复的多调用批次两种情况。
+// 硬性的 maxSteps 防护仍然是最终的安全网；
+// 这个机制只是防止循环在相同失败上消耗整个预算。
 func (a *Agent) applyStormBreaker(calls []provider.ToolCall, outcomes []toolOutcome, results []string) {
 	sig, ok := batchStormSignature(calls, outcomes)
 	if !ok {
@@ -1669,12 +1915,15 @@ func (a *Agent) applyStormBreaker(calls []provider.ToolCall, outcomes []toolOutc
 		short, a.stormCount)})
 }
 
-// batchStormSignature returns a per-turn fixation signature — each call's
-// (name, error) in order — and ok=true only when every call errored and none was
-// merely blocked. ok=false (any success or block) means the turn made varied
-// progress, so the caller resets the counter. Keying on the error rather than the
-// args is deliberate: a stuck model reworks the arguments while failing the same
-// way, so identical-args matching would miss the loop.
+// batchStormSignature 返回每回合的"固执"签名——每个调用的 (name, error) 按顺序排列。
+//
+// 返回值：
+//   - string: 签名字符串（空表示无签名）
+//   - bool: ok=true 仅当每个调用都出错且没有一个被阻止。
+//     ok=false（任何成功或阻止）意味着回合取得了多样化的工作，调用者应重置计数器。
+//
+// 设计决策：基于 error 而非 args 进行键控——因为卡住的模型会对参数进行表面修改
+// （重新措辞、重新排序）而每次都以相同方式失败，因此基于 args 的匹配会错过循环。
 func batchStormSignature(calls []provider.ToolCall, outcomes []toolOutcome) (string, bool) {
 	if len(calls) == 0 {
 		return "", false
@@ -1692,11 +1941,15 @@ func batchStormSignature(calls []provider.ToolCall, outcomes []toolOutcome) (str
 	return sb.String(), true
 }
 
-// toolOutcome is one tool call's result, split into the model-facing output and
-// the display-facing notice bits. errMsg is the short failure reason (empty on
-// success) — a refused call, an unknown tool, or an execution error — so a sink
-// renders the result as failed ("⊘ name <errMsg>" / a red card) instead of OK;
-// blocked narrows that to a refusal (plan mode / permission). truncMsg is set
+// toolOutcome 是单个工具调用的结果，分为面向模型的输出和面向显示的通知部分。
+//
+// 字段说明：
+//   - output: 面向模型的结果文本（成功时为正常输出，失败时包含错误详情）
+//   - blocked: 是否被阻止（计划模式或权限拒绝）
+//   - errMsg: 短的失败原因（成功时为空）——被拒绝的调用、未知工具或执行错误，
+//     以便 Sink 将结果渲染为失败（"⊘ name <errMsg>" / 红色卡片）而非 OK
+//   - truncated: 输出是否被截断（head+tail）
+//   - truncMsg: 截断通知消息（未截断时为空）
 // (without the "· " prefix) when the output was head+tailed.
 type toolOutcome struct {
 	output    string
@@ -1706,9 +1959,23 @@ type toolOutcome struct {
 	truncMsg  string
 }
 
-// executeOne runs a single tool call. It is pure with respect to the event sink
-// — the caller emits ToolDispatch/ToolResult — so it is safe to invoke from
-// parallel goroutines.
+// executeOne 运行单个工具调用。
+//
+// 执行流程：
+//  1. 验证工具是否存在于注册表中
+//  2. 检查重复成功阻止（防止模型反复执行相同的成功写入）
+//  3. 检查计划模式限制（只读模式下拒绝写入工具）
+//  4. 检查权限门控（Gate）
+//  5. 触发 PreToolUse 钩子（可能阻止调用）
+//  6. 对写入工具进行文件快照（用于检查点/回滚）
+//  7. 构建工具调用上下文（包含 Sink、Asker、证据账本等）
+//  8. 执行工具的 Execute 方法
+//  9. 记录证据回执
+//  10. 触发 PostToolUse 钩子
+//  11. 处理结果（截断、错误处理等）
+//
+// 此方法对事件发射器是纯的——调用者负责发射 ToolDispatch/ToolResult——
+// 因此可以从并行的 goroutine 中安全调用。
 func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutcome {
 	t, ok := a.tools.Get(call.Name)
 	if !ok {
@@ -1842,6 +2109,14 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	return toolOutcome{output: body, truncated: truncMsg != "", truncMsg: truncMsg}
 }
 
+// planModeBlocked 检查工具调用是否在计划模式下被阻止。
+//
+// 检查顺序：
+//  1. 如果工具是只读的，允许
+//  2. 如果工具在 planModeDeniedTools 列表中，拒绝
+//  3. 如果工具在 planModeAllowedTools 列表中，允许（白名单豁免）
+//  4. 如果是 bash 工具，检查命令是否安全（只读前缀、无危险元字符）
+//  5. 其他写入工具，拒绝
 func (a *Agent) planModeBlocked(toolName string, readOnly bool, args json.RawMessage) (blocked bool, message string) {
 	if readOnly {
 		return false, ""
@@ -1861,6 +2136,12 @@ func (a *Agent) planModeBlocked(toolName string, readOnly bool, args json.RawMes
 	return true, fmt.Sprintf("blocked: %q is a writer tool and plan mode is read-only. Keep exploring with read-only tools, then write your plan as your reply — the user will be asked to approve it before any changes are made.", toolName)
 }
 
+// planModeBashBlocked 检查 bash 命令在计划模式下是否被阻止。
+//
+// 检查策略：
+//  1. 拒绝包含 shell 元字符的命令（链接、管道、重定向、替换）
+//  2. 检查命令前缀是否在安全只读白名单中
+//  3. 即使命令前缀安全，也检查参数是否包含写入操作（如 find -exec, go -fix）
 func planModeBashBlocked(args json.RawMessage) (bool, string) {
 	var p struct {
 		Command string `json:"command"`
@@ -1895,6 +2176,9 @@ func planModeBashBlocked(args json.RawMessage) (bool, string) {
 	return true, fmt.Sprintf("blocked: bash commands in plan mode must be read-only. %q is not in the safe command list. Use read-only tools for exploration, then exit plan mode to run this command.", cmd)
 }
 
+// planModeBashMatchesSafePrefix 检查小写命令是否以安全前缀开头，
+// 并要求前缀之后是 shell 参数边界（空白字符或字符串结尾）。
+// 这确保 "echop" 不会匹配 "echo"。
 func planModeBashMatchesSafePrefix(lower, safe string) bool {
 	if !strings.HasPrefix(lower, safe) {
 		return false
@@ -1906,6 +2190,12 @@ func planModeBashMatchesSafePrefix(lower, safe string) bool {
 	return unicode.IsSpace(r)
 }
 
+// planModeUnsafeSafeCommandArg 检查安全命令的参数中是否包含不安全的写入操作参数。
+// 例如：
+//   - find 命令的 -delete, -exec, -execdir 等参数
+//   - go list/vet 的 -fix, -mod, -toolexec 等参数
+//   - git 命令的 --output, --ext-diff 等参数
+// 返回第一个不安全参数，如果没有则返回空字符串。
 func planModeUnsafeSafeCommandArg(cmd, safe string) string {
 	fields := strings.Fields(cmd)
 	base := strings.Fields(safe)
@@ -1948,6 +2238,9 @@ func planModeUnsafeSafeCommandArg(cmd, safe string) string {
 	return ""
 }
 
+// repeatedSuccessBlock 检查写入类工具调用是否已在本回合中成功执行了多次。
+// 如果是，阻止调用并返回阻止消息，防止模型反复执行相同的成功写入。
+// 这是风暴断路器的互补机制：风暴断路器关注重复失败，此机制关注重复成功。
 func (a *Agent) repeatedSuccessBlock(call provider.ToolCall, t tool.Tool) (string, bool) {
 	sig, ok := repeatSuccessSignature(call, t)
 	if !ok || a.repeatSuccessCounts == nil {
@@ -1962,6 +2255,7 @@ func (a *Agent) repeatedSuccessBlock(call provider.ToolCall, t tool.Tool) (strin
 		call.Name, count), true
 }
 
+// recordRepeatSuccess 记录写入类工具调用的成功执行，用于重复成功检测。
 func (a *Agent) recordRepeatSuccess(call provider.ToolCall, t tool.Tool) {
 	sig, ok := repeatSuccessSignature(call, t)
 	if !ok {
@@ -1973,6 +2267,9 @@ func (a *Agent) recordRepeatSuccess(call provider.ToolCall, t tool.Tool) {
 	a.repeatSuccessCounts[sig]++
 }
 
+// repeatSuccessSignature 为写入类工具调用生成用于重复检测的签名。
+// 只读工具返回 ok=false（不跟踪）；写入工具返回工具名+规范化参数的签名。
+// bash 命令需要特殊处理：只有文件写入命令才跟踪，后台命令不跟踪。
 func repeatSuccessSignature(call provider.ToolCall, t tool.Tool) (string, bool) {
 	if t.ReadOnly() {
 		return "", false
@@ -1997,6 +2294,8 @@ func repeatSuccessSignature(call provider.ToolCall, t tool.Tool) (string, bool) 
 	}
 }
 
+// canonicalToolArgs 将工具参数规范化为紧凑的 JSON 字符串。
+// 先解析为任意值，再重新序列化，确保语义相同但格式一致的参数产生相同的签名。
 func canonicalToolArgs(raw string) string {
 	var v any
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
@@ -2013,10 +2312,19 @@ func canonicalToolArgs(raw string) string {
 	return compact.String()
 }
 
+// normalizeShellCommand 将 shell 命令规范化为单空格分隔的形式。
+// 这确保了语义相同但空白不同的命令产生相同的签名。
 func normalizeShellCommand(command string) string {
 	return strings.Join(strings.Fields(command), " ")
 }
 
+// isShellFileWriteCommand 检查 shell 命令是否是文件写入命令。
+// 用于重复成功检测：只有文件写入命令才需要跟踪，普通命令不跟踪。
+// 检测的模式包括：
+//   - Python 的 open() 写入模式
+//   - PowerShell 的 Set-Content/Add-Content/Out-File
+//   - sed -i / perl -pi 原地编辑
+//   - shell 重定向（>）
 func isShellFileWriteCommand(command string) bool {
 	lower := strings.ToLower(command)
 	switch {
@@ -2033,6 +2341,11 @@ func isShellFileWriteCommand(command string) bool {
 	}
 }
 
+// shellPythonOpenWrites 检查 shell 命令中是否包含 Python 的 open() 文件写入操作。
+// 检测模式：
+//   - open(...).write(...) 调用
+//   - open(..., 'w'/'a'/'x', ...) 写入模式
+//   - open(..., mode='w'/'a'/'x', ...) 关键字参数形式
 func shellPythonOpenWrites(lower string) bool {
 	if !strings.Contains(lower, "open(") {
 		return false
@@ -2048,6 +2361,9 @@ func shellPythonOpenWrites(lower string) bool {
 	return false
 }
 
+// hasShellWriteRedirect 检查 shell 命令中是否包含输出重定向（>）。
+// 正确处理引号内的 > 字符（不视为重定向）。
+// 注意：2>（标准错误重定向）不被视为文件写入。
 func hasShellWriteRedirect(command string) bool {
 	var quote rune
 	var prev rune
@@ -2076,8 +2392,8 @@ func hasShellWriteRedirect(command string) bool {
 	return false
 }
 
-// isBackgroundTaskCall reports whether a `task` call set run_in_background, so a
-// fire-and-return dispatch isn't mistaken for a sub-agent that has stopped.
+// isBackgroundTaskCall 报告 `task` 调用是否设置了 run_in_background，
+// 以便火-and-return 的分派不会被误认为是已停止的子代理。
 func isBackgroundTaskCall(args string) bool {
 	var p struct {
 		RunInBackground bool `json:"run_in_background"`
@@ -2086,15 +2402,15 @@ func isBackgroundTaskCall(args string) bool {
 	return p.RunInBackground
 }
 
-// toolReadOnly reports a tool's ReadOnly classification by name (false for an
-// unknown tool), for stamping early ToolDispatch events.
+// toolReadOnly 按名称报告工具的 ReadOnly 分类（未知工具返回 false），
+// 用于在早期的 ToolDispatch 事件中标记工具类型。
 func (a *Agent) toolReadOnly(name string) bool {
 	t, ok := a.tools.Get(name)
 	return ok && t.ReadOnly()
 }
 
-// firstLine returns s up to its first newline — a one-line failure summary for
-// the display Err, while the full error stays in the model-facing output.
+// firstLine 返回 s 中第一个换行符之前的部分——用于显示的单行失败摘要，
+// 而完整的错误保留在面向模型的输出中。
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return s[:i]
@@ -2102,10 +2418,16 @@ func firstLine(s string) string {
 	return s
 }
 
-// truncateToolOutput head+tails s when it exceeds maxToolOutputBytes, slicing
-// on rune boundaries so we never split a multibyte glyph. Returns the possibly
-// trimmed body plus a one-line user-facing notice when truncation happened
-// (empty when it didn't, without the "· " display prefix).
+// truncateToolOutput 当 s 超过 maxToolOutputBytes 时进行 head+tail 截断，
+// 在 rune 边界上切片以确保不会拆分多字节字符。
+//
+// 截断策略：保留头部和尾部各一半的字节预算，中间部分用省略标记替换。
+// 这样既保留了输出的开头（通常是最重要的信息）和结尾（通常是总结），
+// 又防止了过大的输出耗尽模型的上下文窗口。
+//
+// 返回值：
+//   - string: 可能被修剪的文本内容
+//   - string: 发生截断时的单行用户通知（未截断时为空）
 func truncateToolOutput(s string) (string, string) {
 	if len(s) <= maxToolOutputBytes {
 		return s, ""
@@ -2119,8 +2441,8 @@ func truncateToolOutput(s string) (string, string) {
 	return body, notice
 }
 
-// snapToRuneBoundary returns s[lo:hi] with the bounds nudged outward until
-// both land on rune-start positions.
+// snapToRuneBoundary 返回 s[lo:hi]，将边界向外调整直到两个边界都落在 rune 起始位置。
+// 这确保了切片操作不会拆分多字节的 Unicode 字符。
 func snapToRuneBoundary(s string, lo, hi int) string {
 	for lo > 0 && !utf8.RuneStart(s[lo]) {
 		lo--
@@ -2131,9 +2453,15 @@ func snapToRuneBoundary(s string, lo, hi int) string {
 	return s[lo:hi]
 }
 
-// finishReasonMessage maps an abnormal finish_reason to a one-line warning,
-// returning ok=false for the normal terminations ("stop", "tool_calls") and a
-// nil usage. The sink renders the message; the "! " prefix is presentation.
+// finishReasonMessage 将异常的 finish_reason 映射为单行警告消息。
+//
+// 对于正常的终止（"stop", "tool_calls"）和 nil 的 usage 返回 ok=false。
+// Sink 负责渲染消息；"! " 前缀是展示层的约定。
+//
+// 异常终止类型：
+//   - "length": 输出被截断，达到了最大输出 token 限制
+//   - "content_filter": 输出被内容过滤器阻止
+//   - "repetition_truncation": 检测到模型重复，输出被截断
 func finishReasonMessage(u *provider.Usage) (string, bool) {
 	if u == nil {
 		return "", false

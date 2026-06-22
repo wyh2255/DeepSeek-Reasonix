@@ -1,19 +1,22 @@
-// Package anthropic implements the Anthropic Messages API provider (POST
-// /v1/messages, SSE streaming) with a hand-written net/http client — no SDK. It
-// self-registers under the "anthropic" kind, so any Claude model is a config
-// instance rather than code.
+// Package anthropic 实现了 Anthropic Messages API 提供者（POST /v1/messages，SSE 流式）。
+// 使用纯 net/http 客户端实现（无 SDK 依赖），自注册为 "anthropic" 类型。
 //
-// Two notes, both rooted in the transport-agnostic provider.Message abstraction:
+// 设计要点:
 //
-//   - Extended thinking is opt-in (provider config thinking="adaptive"). Anthropic
-//     requires the *signed* thinking block be replayed on the next turn when a tool
-//     call followed thinking, so Message carries ReasoningSignature alongside
-//     ReasoningContent and this provider replays the signed block on the next
-//     request. Off by default because the field is Anthropic-specific — an
-//     OpenAI-compatible gateway (e.g. DeepSeek's) would reject it. (redacted_thinking
-//     blocks are not yet captured/replayed.)
-//   - No temperature/top_p. Current Claude models (Opus 4.8/4.7) reject sampling
-//     parameters with a 400; Anthropic steers behavior via prompting instead.
+//   - Extended Thinking（扩展思维）: 通过配置 thinking="adaptive" 开启。
+//     Anthropic 要求当工具调用紧随思维链之后时，必须回传带签名的 thinking block。
+//     Message 结构体通过 ReasoningSignature 字段支持签名的往返传递。
+//     默认关闭，因为此字段是 Anthropic 特有的——OpenAI 兼容网关（如 DeepSeek）会拒绝它。
+//     （redacted_thinking blocks 尚未支持捕获/回传。）
+//
+//   - 无 temperature/top_p: 当前 Claude 模型（Opus 4.8/4.7）会以 400 拒绝采样参数；
+//     Anthropic 通过 prompting 引导行为。
+//
+//   - Prompt 缓存: 在 system、tools、messages 的最后一个块上设置 ephemeral 缓存控制，
+//     实现增量缓存命中。
+//
+//   - 消息转换: 传输无关的 Message 转换为 Anthropic 的 content block 格式，
+//     包括 system 消息提升到顶层、tool_use/tool_result 块的转换、连续同角色消息合并。
 package anthropic
 
 import (
@@ -32,31 +35,36 @@ import (
 	"reasonix/internal/provider"
 )
 
-// defaultStreamIdleTimeout caps how long a started SSE stream may go silent before
-// it's treated as a dropped connection — a half-open TCP connection (proxy switched
-// mid-stream) sends no RST, so scanner.Scan() would block forever. Generous on
-// purpose; live streams emit far more often. Stored per-client (client.idleTimeout)
-// so a test can shorten it without a shared global that races other watchdogs.
+// defaultStreamIdleTimeout 是 SSE 流的最大空闲超时时间。
+// 半开的 TCP 连接（如代理在流式传输中切换）不会发送 RST，scanner.Scan() 会永久阻塞；
+// 此超时将挂起转为可恢复错误。120 秒足够宽裕——正常流的 token/keepalive 远比这频繁。
 const defaultStreamIdleTimeout = 120 * time.Second
 
 const (
-	// anthropicVersion is the required API version header value.
+	// anthropicVersion 是必需的 API 版本头部值。
 	anthropicVersion = "2023-06-01"
-	// defaultBaseURL is the first-party endpoint; config may override it (e.g. a
-	// gateway). Bedrock/Vertex use a different request shape and are out of scope.
+	// defaultBaseURL 是 Anthropic 官方端点；配置可覆盖（如使用网关）。
+	// Bedrock/Vertex 使用不同的请求格式，不在范围内。
 	defaultBaseURL = "https://api.anthropic.com"
-	// defaultMaxTokens is the output ceiling used when the request leaves MaxTokens
-	// unset. Anthropic *requires* max_tokens, and the agent currently doesn't set
-	// it, so this is the de-facto cap. Generous (you only pay for tokens actually
-	// produced) and within every catalog model's limit (Sonnet/Haiku 64K, Opus 128K).
+	// defaultMaxTokens 是请求未指定 MaxTokens 时的默认输出上限。
+	// Anthropic *要求* max_tokens 字段，agent 当前不设置此值，因此这是实际上限。
+	// 32K 足够慷慨（只为实际生成的 token 付费），且在所有模型限制内（Sonnet/Haiku 64K，Opus 128K）。
 	defaultMaxTokens = 32768
 )
 
+// init 在包加载时自动注册 "anthropic" 类型的提供者工厂。
 func init() {
 	provider.Register("anthropic", New)
 }
 
-// New builds an Anthropic provider from a resolved config.
+// New 从已解析的配置构建 Anthropic 提供者。
+//
+// 初始化流程:
+//   1. 验证必需字段（Model）
+//   2. 处理 baseURL：去除尾部 /v1（用户可能粘贴完整的 OpenAI 兼容 URL）
+//   3. 解析 thinking、effort、vision 等配置
+//   4. 创建 HTTP 客户端
+//   5. 返回配置好的 client 实例
 func New(cfg provider.Config) (provider.Provider, error) {
 	if cfg.Model == "" {
 		return nil, fmt.Errorf("anthropic: model is required for provider %q", cfg.Name)
@@ -108,28 +116,32 @@ func New(cfg provider.Config) (provider.Provider, error) {
 	}, nil
 }
 
+// newHTTPClient 创建带代理支持的 HTTP 客户端。
+// Anthropic 的 HTTP 客户端无整体超时——生命周期由 context 驱动。
 func newHTTPClient(cfg provider.Config) (*http.Client, error) {
 	spec, _ := cfg.Extra["proxy_spec"].(netclient.ProxySpec)
 	return netclient.NewHTTPClient(spec, netclient.TransportOptions{})
 }
 
+// client 是 Anthropic 提供者的内部实现。
 type client struct {
-	name        string
-	apiKey      string
-	keyEnv      string // api_key_env name, surfaced in auth errors
-	keySource   string // source of keyEnv, surfaced in auth errors
-	baseURL     string
-	model       string
-	thinking    string // "adaptive" enables extended thinking; "" = off (config-driven)
-	effort      string // output_config.effort: low|medium|high|xhigh|max; "" = provider default
-	vision      bool   // model accepts image input — embed attached images as base64 image blocks
-	http        *http.Client
-	idleTimeout time.Duration // SSE stall watchdog window; defaultStreamIdleTimeout unless a test overrides
-	authed      atomic.Bool   // a request has succeeded — gate transient-401 retry
+	name        string        // 提供者实例名称（如 "anthropic"、"claude"）
+	apiKey      string        // API 密钥
+	keyEnv      string        // 密钥来源的环境变量名，用于认证错误信息
+	keySource   string        // 密钥来源的人类可读描述
+	baseURL     string        // API 根 URL（不含 /v1）
+	model       string        // 模型标识符（如 "claude-opus-4-0520"）
+	thinking    string        // "adaptive" 开启扩展思维，"" 关闭
+	effort      string        // 输出配置: low|medium|high|xhigh|max，"" 使用提供者默认值
+	vision      bool          // 是否支持图片输入（嵌入 base64 image blocks）
+	http        *http.Client  // 带代理支持的 HTTP 客户端
+	idleTimeout time.Duration // SSE 空闲看门狗超时窗口
+	authed      atomic.Bool   // 是否曾有请求成功（用于判断是否重试瞬态 401）
 }
 
 func (c *client) Name() string { return c.name }
 
+// sendOpts 构建发送选项，携带提供者上下文信息用于错误标记和认证重试判断。
 func (c *client) sendOpts() provider.SendOptions {
 	return provider.SendOptions{
 		Provider:   c.name,
@@ -146,6 +158,13 @@ var bufPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
 
+// Stream 启动流式补全，将增量事件推送到返回的 channel。
+//
+// 流程:
+//   1. 构建请求体（JSON 编码），使用 bufPool 复用缓冲区减少 GC 压力
+//   2. 通过 SendWithRetry 发送请求（带重试和退避）
+//   3. 标记认证成功（authed），后续瞬态 401 可重试
+//   4. 启动 goroutine 执行流式读取（Anthropic 不支持流重连）
 func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provider.Chunk, error) {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -179,11 +198,17 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 	return out, nil
 }
 
-// buildRequest converts the transport-agnostic Request into the Messages API shape:
-// RoleSystem messages lift to the top-level `system` field; assistant tool calls
-// become `tool_use` blocks; RoleTool results become `tool_result` blocks in a user
-// turn. Consecutive same-role messages are coalesced because the API requires
-// alternating user/assistant turns (tool results are user turns).
+// buildRequest 将传输无关的 Request 转换为 Anthropic Messages API 格式。
+//
+// 消息转换规则:
+//   - RoleSystem → 提升到顶层 system 字段（Anthropic 不支持 system role 消息）
+//   - RoleUser → user 消息，图片转为 base64 image blocks（如果开启 vision）
+//   - RoleTool → tool_result blocks，合并到前一个 user 消息中
+//   - RoleAssistant → assistant 消息，包含 text/tool_use/thinking blocks
+//     - 思维链回传: 当 thinking 开启且有签名时，插入 thinking block
+//     - 工具调用: 转换为 tool_use blocks（input 为空时填充 {}）
+//
+// 连续同角色消息合并: API 要求 user/assistant 严格交替（tool_result 属于 user 回合）。
 func (c *client) buildRequest(req provider.Request) anthRequest {
 	var system []textBlock
 	var msgs []anthMessage
@@ -256,11 +281,12 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 		tools = append(tools, anthTool{Name: t.Name, Description: t.Description, InputSchema: schema})
 	}
 
-	// Prompt-cache breakpoints (ephemeral, prefix-match). Render order is
-	// tools → system → messages, so a marker on the last system block caches
-	// tools+system together; with no system, mark the last tool. A marker on the
-	// last block of the last message caches the conversation prefix, accruing hits
-	// incrementally as turns are appended. Max 4 breakpoints; we use ≤2.
+	// Prompt 缓存断点（ephemeral，前缀匹配）。
+	// 渲染顺序: tools → system → messages。
+	// 在最后一个 system 块上标记可缓存 tools+system；
+	// 无 system 时标记最后一个 tool。
+	// 在最后一条消息的最后一个块上标记可缓存对话前缀，
+	// 随着回合追加增量累积命中。最多 4 个断点，我们使用 ≤2 个。
 	if n := len(system); n > 0 {
 		system[n-1].CacheControl = ephemeral()
 	} else if n := len(tools); n > 0 {
@@ -296,11 +322,23 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 	return r
 }
 
-// readStream parses the Messages API SSE stream into Chunks. Text deltas emit live;
-// each tool_use content block emits a ChunkToolCallStart when its id+name are known
-// and a complete ChunkToolCall when the block closes; usage is assembled from
-// message_start (input/cache) + message_delta (output + stop_reason) and emitted
-// once before ChunkDone.
+// readStream 解析 Anthropic Messages API 的 SSE 流为 Chunk 事件。
+//
+// 事件处理:
+//   - message_start: 提取输入 token 和缓存统计（inTok/cacheCreate/cacheRead）
+//   - content_block_start: 工具调用开始（提取 ID+Name，发出 ChunkToolCallStart）
+//   - content_block_delta: 内容增量
+//     - text_delta → ChunkText
+//     - thinking_delta → ChunkReasoning（思维内容）
+//     - signature_delta → ChunkReasoning（思维签名）
+//     - input_json_delta → 累积工具调用参数
+//   - content_block_stop: 工具调用完成（发出 ChunkToolCall）
+//   - message_delta: 提取输出 token 和停止原因
+//   - message_stop: 流完成
+//   - error: 流错误
+//
+// 使用量在流结束后从 message_start + message_delta 组装并发出。
+// 空闲看门狗与 OpenAI 提供者相同（120 秒超时）。
 func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 	defer resp.Body.Close()
 	defer close(out)
@@ -453,8 +491,8 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 	out <- provider.Chunk{Type: provider.ChunkDone}
 }
 
-// mapStopReason translates Anthropic stop reasons to the OpenAI-style finish
-// reasons the agent already recognises (it surfaces abnormal ones like "length").
+// mapStopReason 将 Anthropic 的停止原因转换为 OpenAI 风格的 finish reason。
+// agent 已识别这些标准值（如 "length" 表示异常终止）。
 func mapStopReason(s string) string {
 	switch s {
 	case "end_turn", "stop_sequence":
@@ -468,105 +506,128 @@ func mapStopReason(s string) string {
 	}
 }
 
-// --- Messages API wire protocol ---
+// --- Messages API wire protocol 类型定义 ---
+// 以下类型定义了 Anthropic Messages API 的请求和响应 JSON 结构。
 
+// ephemeral 创建 ephemeral 缓存控制标记，用于 prompt 缓存断点。
 func ephemeral() *cacheControl { return &cacheControl{Type: "ephemeral"} }
 
+// cacheControl 是 Anthropic 的 prompt 缓存控制标记。
 type cacheControl struct {
-	Type string `json:"type"`
+	Type string `json:"type"` // "ephemeral"
 }
 
+// anthRequest 是发送到 /v1/messages 的请求体。
 type anthRequest struct {
-	Model        string          `json:"model"`
-	MaxTokens    int             `json:"max_tokens"`
-	System       []textBlock     `json:"system,omitempty"`
-	Messages     []anthMessage   `json:"messages"`
-	Tools        []anthTool      `json:"tools,omitempty"`
-	Thinking     *thinkingConfig `json:"thinking,omitempty"`
-	OutputConfig *outputConfig   `json:"output_config,omitempty"`
-	Stream       bool            `json:"stream"`
+	Model        string          `json:"model"`                    // 模型标识符
+	MaxTokens    int             `json:"max_tokens"`               // 最大输出 token 数（必需）
+	System       []textBlock     `json:"system,omitempty"`         // 系统提示词（顶层字段）
+	Messages     []anthMessage   `json:"messages"`                 // 对话消息列表
+	Tools        []anthTool      `json:"tools,omitempty"`          // 工具定义列表
+	Thinking     *thinkingConfig `json:"thinking,omitempty"`       // 扩展思维配置
+	OutputConfig *outputConfig   `json:"output_config,omitempty"`  // 输出配置（effort 级别）
+	Stream       bool            `json:"stream"`                   // 是否流式输出
 }
 
+// thinkingConfig 控制 Anthropic 的扩展思维功能。
 type thinkingConfig struct {
-	Type    string `json:"type"`              // "adaptive"
-	Display string `json:"display,omitempty"` // "summarized" to stream the reasoning text
+	Type    string `json:"type"`              // "adaptive"（自动决定是否使用思维）
+	Display string `json:"display,omitempty"` // "summarized" 使推理文本可流式输出
 }
 
+// outputConfig 控制输出配置。
 type outputConfig struct {
-	Effort string `json:"effort,omitempty"` // low | medium | high | xhigh | max
+	Effort string `json:"effort,omitempty"` // 推理深度: low | medium | high | xhigh | max
 }
 
+// textBlock 是系统提示词中的文本块。
 type textBlock struct {
-	Type         string        `json:"type"`
-	Text         string        `json:"text"`
-	CacheControl *cacheControl `json:"cache_control,omitempty"`
+	Type         string        `json:"type"`                      // "text"
+	Text         string        `json:"text"`                      // 文本内容
+	CacheControl *cacheControl `json:"cache_control,omitempty"`   // 缓存控制标记
 }
 
+// anthMessage 是请求中的单条消息。
 type anthMessage struct {
-	Role    string         `json:"role"`
-	Content []contentBlock `json:"content"`
+	Role    string         `json:"role"`    // "user" 或 "assistant"
+	Content []contentBlock `json:"content"` // 内容块列表
 }
 
-// contentBlock is the union of the block kinds we emit in a request: text,
-// tool_use (echoing a prior assistant call), and tool_result. Unused fields are
-// omitted so each block serialises to its canonical shape.
+// contentBlock 是请求中的内容块联合体。
+// 根据 Type 字段的不同，使用不同的字段组合：
+//   - "text": 文本块（Text）
+//   - "thinking": 思维链块（Thinking + Signature）
+//   - "tool_use": 工具调用块（ID + Name + Input）
+//   - "tool_result": 工具结果块（ToolUseID + Content）
+//   - "image": 图片块（Source）
 type contentBlock struct {
-	Type         string          `json:"type"`
-	Text         string          `json:"text,omitempty"`        // text
-	Thinking     string          `json:"thinking,omitempty"`    // thinking
-	Signature    string          `json:"signature,omitempty"`   // thinking
-	ID           string          `json:"id,omitempty"`          // tool_use
-	Name         string          `json:"name,omitempty"`        // tool_use
-	Input        json.RawMessage `json:"input,omitempty"`       // tool_use
-	ToolUseID    string          `json:"tool_use_id,omitempty"` // tool_result
-	Content      string          `json:"content,omitempty"`     // tool_result
-	Source       *imageSource    `json:"source,omitempty"`      // image
-	CacheControl *cacheControl   `json:"cache_control,omitempty"`
+	Type         string          `json:"type"`                      // 块类型
+	Text         string          `json:"text,omitempty"`            // text: 文本内容
+	Thinking     string          `json:"thinking,omitempty"`        // thinking: 思维链内容
+	Signature    string          `json:"signature,omitempty"`       // thinking: 思维链签名
+	ID           string          `json:"id,omitempty"`              // tool_use: 调用 ID
+	Name         string          `json:"name,omitempty"`            // tool_use: 工具名称
+	Input        json.RawMessage `json:"input,omitempty"`           // tool_use: 参数 JSON
+	ToolUseID    string          `json:"tool_use_id,omitempty"`     // tool_result: 关联的调用 ID
+	Content      string          `json:"content,omitempty"`         // tool_result: 结果内容
+	Source       *imageSource    `json:"source,omitempty"`          // image: 图片数据源
+	CacheControl *cacheControl   `json:"cache_control,omitempty"`   // 缓存控制标记
 }
 
+// imageSource 是图片内容块的数据源（base64 编码）。
 type imageSource struct {
-	Type      string `json:"type"` // "base64"
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // MIME 类型（如 "image/png"）
+	Data      string `json:"data"`       // base64 编码的图片数据
 }
 
+// anthTool 是请求中的工具定义。
 type anthTool struct {
-	Name         string          `json:"name"`
-	Description  string          `json:"description,omitempty"`
-	InputSchema  json.RawMessage `json:"input_schema"`
-	CacheControl *cacheControl   `json:"cache_control,omitempty"`
+	Name         string          `json:"name"`                      // 工具名称
+	Description  string          `json:"description,omitempty"`     // 工具描述
+	InputSchema  json.RawMessage `json:"input_schema"`              // 参数的 JSON Schema
+	CacheControl *cacheControl   `json:"cache_control,omitempty"`   // 缓存控制标记
 }
 
-// streamEvent is the discriminated SSE event; read the fields matching Type.
+// streamEvent 是 SSE 流中的鉴别联合事件。
+// 根据 Type 字段读取对应的子结构：
+//   - "message_start": 消息开始（含输入 token 统计）
+//   - "content_block_start": 内容块开始（工具调用的 ID+Name）
+//   - "content_block_delta": 内容块增量（文本/思维/签名/参数）
+//   - "content_block_stop": 内容块结束（工具调用完成）
+//   - "message_delta": 消息增量（输出 token + 停止原因）
+//   - "message_stop": 消息结束
+//   - "error": 流错误
 type streamEvent struct {
-	Type    string `json:"type"`
-	Index   int    `json:"index"`
+	Type    string `json:"type"`  // 事件类型
+	Index   int    `json:"index"` // 内容块索引（用于关联 tool_use 块）
 	Message *struct {
-		Usage *wireUsage `json:"usage"`
+		Usage *wireUsage `json:"usage"` // message_start: 输入 token 统计
 	} `json:"message"`
 	ContentBlock *struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		Name string `json:"name"`
+		Type string `json:"type"` // content_block_start: 块类型（如 "tool_use"）
+		ID   string `json:"id"`   // content_block_start: 工具调用 ID
+		Name string `json:"name"` // content_block_start: 工具名称
 	} `json:"content_block"`
 	Delta *struct {
-		Type        string `json:"type"`         // text_delta | thinking_delta | signature_delta | input_json_delta
-		Text        string `json:"text"`         // text_delta
-		Thinking    string `json:"thinking"`     // thinking_delta
-		Signature   string `json:"signature"`    // signature_delta
-		PartialJSON string `json:"partial_json"` // input_json_delta
-		StopReason  string `json:"stop_reason"`  // message_delta
+		Type        string `json:"type"`         // content_block_delta: 增量类型
+		Text        string `json:"text"`         // text_delta: 文本增量
+		Thinking    string `json:"thinking"`     // thinking_delta: 思维链增量
+		Signature   string `json:"signature"`    // signature_delta: 思维签名
+		PartialJSON string `json:"partial_json"` // input_json_delta: 工具参数增量
+		StopReason  string `json:"stop_reason"`  // message_delta: 停止原因
 	} `json:"delta"`
-	Usage *wireUsage `json:"usage"` // message_delta (cumulative output_tokens)
+	Usage *wireUsage `json:"usage"` // message_delta: 输出 token 统计
 	Error *struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
+		Type    string `json:"type"`    // 错误类型
+		Message string `json:"message"` // 错误消息
 	} `json:"error"`
 }
 
+// wireUsage 是 Anthropic 的 token 使用量统计。
 type wireUsage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	InputTokens              int `json:"input_tokens"`               // 输入 token 数
+	OutputTokens             int `json:"output_tokens"`              // 输出 token 数
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"` // 缓存创建的输入 token 数
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`    // 缓存读取的输入 token 数
 }

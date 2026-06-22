@@ -1,3 +1,13 @@
+// 文件：goal.go
+//
+// 目标有限状态机（FSM）——驱动自主多轮目标执行。
+// goalMachine 拥有活动目标的有限状态机及其持久化。它是一个严格的叶子：
+// 其方法仅获取自己的锁，永远不会回调 Controller，因此控制器可以在持有 c.mu 的
+// 同时调用 getter 而不会有锁反转风险。
+//
+// FSM 是纯函数式的——advance() 接收已收集的输入（解析的标记、执行器的 todo 快照
+// 和就绪状态、是否有工具运行），返回需要持久化的内容和通知，因此在 mu 下不会
+// 发生磁盘或执行器工作。
 package control
 
 import (
@@ -21,13 +31,20 @@ const (
 	goalSelfCheckTurn = "The agent signaled goal completion and all tasks are marked done. Before finalizing, perform a brief quality self-check:\n1. Verify any changed files compile or parse correctly\n2. Run the relevant tests if applicable\n3. Confirm the original requirements are met\nIf everything checks out, signal [goal:complete]. If issues are found, fix them and signal [goal:complete] when done."
 )
 
-// goalMachine owns the active goal's finite-state machine and its persistence.
-// It is a strict leaf: its methods take only the machine's own locks and never
-// call back into the Controller, so the controller may hold c.mu while invoking
-// a getter without risking lock inversion. The FSM is pure — advance() takes
-// already-gathered inputs (the parsed marker, the executor's todo snapshot and
-// readiness, whether a tool ran) and returns what to persist plus a notice, so
-// no disk or executor work happens under mu.
+// goalMachine 拥有活动目标的有限状态机及其持久化。
+// 它是一个严格的叶子：其方法仅获取自己的锁，永远不会回调 Controller，
+// 因此控制器可以在持有 c.mu 的同时调用 getter 而不会有锁反转风险。
+//
+// FSM 是纯函数式的——advance() 接收已收集的输入（解析的标记、执行器的 todo 快照
+// 和就绪状态、是否有工具运行），返回需要持久化的内容和通知，因此在 mu 下不会
+// 发生磁盘或执行器工作。
+//
+// 状态转换逻辑：
+//   - [goal:complete] 到达时：检查 todo 是否全部完成 → 严格模式下运行自检 → 完成
+//   - [goal:blocked:<reason>] 到达时：累加相同原因的阻塞计数，连续 3 次则阻塞
+//   - [goal:continue] 到达时：重置阻塞/空闲计数，继续循环
+//   - 空闲检测：连续 maxGoalIdleTurns 轮无工具调用则注入提醒
+//   - 超时保护：超过 maxGoalAutoTurns 轮自动阻塞
 type goalMachine struct {
 	// mu guards the FSM fields below; every critical section under it is short
 	// and non-blocking (no disk I/O, no executor calls).

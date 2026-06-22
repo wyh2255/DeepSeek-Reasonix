@@ -1,3 +1,11 @@
+// md.go 实现了 Markdown 到 ANSI 终端文本的渲染器。
+// 该文件负责：
+//   - 使用 Goldmark 解析 Markdown AST，支持 GFM 表格扩展和数学公式扩展
+//   - 将标题、段落、列表、代码块、引用块、表格等渲染为带 ANSI 颜色的终端文本
+//   - 处理行内元素：加粗、斜体、代码片段、链接、数学公式
+//   - 实现 CJK 宽度感知的自动换行，正确处理中文/日文/韩文字符宽度
+//   - 修复 Goldmark 对 CJK 标点符号的 emphasis 边界判断问题
+//   - 支持 GFM 表格的自动列宽计算和单元格换行
 package cli
 
 import (
@@ -15,17 +23,17 @@ import (
 	"github.com/yuin/goldmark/util"
 )
 
-// mdRenderer turns the model's markdown answer into ANSI-styled terminal text
-// using the brand palette. It implements only the constructs a chat-style
-// model reliably emits — headings, paragraphs, lists, fenced code, blockquotes,
-// strong/em/code-spans, links, thematic breaks — and degrades to plain text
-// for anything else. Word-wrapping respects CJK widths and skips over ANSI
-// SGR codes when counting columns.
+// mdRenderer 是 Markdown 终端渲染器，将模型的 Markdown 回答转换为带 ANSI 样式的终端文本。
+// 仅实现聊天模型常用 Markdown 构造的渲染（标题、段落、列表、代码块、引用、强调、链接、
+// 分隔线、表格），其他内容降级为纯文本。自动换行尊重 CJK 字符宽度并跳过 ANSI SGR 转义码。
 type mdRenderer struct {
 	md    goldmark.Markdown
 	width int
 }
 
+// newMarkdownRenderer 创建一个新的 Markdown 渲染器。
+// width 为终端列宽，用于控制自动换行和表格列宽分配。
+// 启用 GFM 表格扩展和自定义数学公式解析器。
 func newMarkdownRenderer(width int) *mdRenderer {
 	if width <= 0 {
 		width = 80
@@ -43,6 +51,7 @@ func newMarkdownRenderer(width int) *mdRenderer {
 	}
 }
 
+// italic 将文本包装为 ANSI 斜体样式。当颜色被禁用时返回原始文本。
 func italic(s string) string {
 	if !colorEnabled {
 		return s
@@ -50,9 +59,9 @@ func italic(s string) string {
 	return "\033[3m" + s + "\033[0m"
 }
 
-// Render parses input as markdown and returns ANSI-styled output with a
-// trailing newline. Empty input returns an empty string so callers can
-// reliably distinguish "nothing to draw" from "draw a blank line".
+// Render 将 Markdown 文本解析并渲染为带 ANSI 样式的终端输出，末尾附加换行符。
+// 空输入返回空字符串，调用方可据此区分"无需绘制"和"绘制空行"。
+// 渲染前会先标准化数学分隔符和修复 CJK emphasis 问题。
 func (r *mdRenderer) Render(input string) string {
 	if strings.TrimSpace(input) == "" {
 		return ""
@@ -163,12 +172,16 @@ func isSpace(r rune) bool {
 	return r == ' ' || r == '\t' || r == '\n' || r == '\r'
 }
 
+// renderBlocks 遍历父节点的所有子块节点并逐一渲染。
 func (r *mdRenderer) renderBlocks(buf *strings.Builder, parent ast.Node, src []byte, indent int) {
 	for c := parent.FirstChild(); c != nil; c = c.NextSibling() {
 		r.renderBlock(buf, c, src, indent)
 	}
 }
 
+// renderBlock 根据节点类型分发到对应的渲染方法。
+// 支持标题、段落、文本块、列表、代码块、引用块、表格和分隔线。
+// 未知类型的块节点会递归渲染其子节点，避免丢失内容。
 func (r *mdRenderer) renderBlock(buf *strings.Builder, node ast.Node, src []byte, indent int) {
 	switch n := node.(type) {
 	case *ast.Heading:
@@ -201,6 +214,7 @@ func (r *mdRenderer) renderBlock(buf *strings.Builder, node ast.Node, src []byte
 	}
 }
 
+// renderHeading 渲染标题节点。一级标题带强调色下划线，其他级别仅使用加粗和颜色。
 func (r *mdRenderer) renderHeading(buf *strings.Builder, n *ast.Heading, src []byte, indent int) {
 	inline := r.collectInline(n, src)
 	buf.WriteString(strings.Repeat(" ", indent))
@@ -239,6 +253,8 @@ func (r *mdRenderer) renderInlineBlock(buf *strings.Builder, n ast.Node, src []b
 	}
 }
 
+// renderList 渲染有序和无序列表。有序列表使用数字标记，无序列表使用 "•" 标记。
+// 列表项的后续行会正确缩进以对齐标记后的文本。
 func (r *mdRenderer) renderList(buf *strings.Builder, n *ast.List, src []byte, indent int) {
 	idx := 1
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
@@ -282,6 +298,7 @@ func (r *mdRenderer) renderList(buf *strings.Builder, n *ast.List, src []byte, i
 	buf.WriteString("\n")
 }
 
+// renderFenced 渲染围栏代码块，每行前添加竖线前缀，代码文本使用强调色。
 func (r *mdRenderer) renderFenced(buf *strings.Builder, n ast.Node, src []byte, indent int) {
 	prefix := strings.Repeat(" ", indent) + dim("│ ")
 	for i := 0; i < n.Lines().Len(); i++ {
@@ -294,6 +311,7 @@ func (r *mdRenderer) renderFenced(buf *strings.Builder, n ast.Node, src []byte, 
 	buf.WriteString("\n")
 }
 
+// renderBlockquote 渲染引用块，每行前添加竖线前缀，文本使用暗色显示。
 func (r *mdRenderer) renderBlockquote(buf *strings.Builder, n *ast.Blockquote, src []byte, indent int) {
 	var inner strings.Builder
 	r.renderBlocks(&inner, n, src, 0)
@@ -306,13 +324,15 @@ func (r *mdRenderer) renderBlockquote(buf *strings.Builder, n *ast.Blockquote, s
 	buf.WriteString("\n")
 }
 
-// collectInline walks an inline subtree and returns its ANSI-styled flat text.
+// collectInline 遍历行内子树并返回带 ANSI 样式的扁平文本。
 func (r *mdRenderer) collectInline(n ast.Node, src []byte) string {
 	var b strings.Builder
 	r.appendInline(&b, n, src)
 	return b.String()
 }
 
+// appendInline 递归遍历行内节点树，将各类型节点转换为 ANSI 样式文本。
+// 处理文本、强调（加粗/斜体）、代码片段、链接、自动链接、原始HTML和数学公式。
 func (r *mdRenderer) appendInline(b *strings.Builder, n ast.Node, src []byte) {
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 		switch v := c.(type) {
@@ -445,10 +465,8 @@ func (r *mdRenderer) renderTable(buf *strings.Builder, n *extast.Table, src []by
 	buf.WriteByte('\n')
 }
 
-// renderTableRow lays out one logical row across multiple visual rows when
-// any cell wraps. wrapAnsi handles per-cell word + hard-break wrapping; the
-// row's visual height = max wrapped lines across all cells. Cells that ran
-// out of content get padded with spaces so the rail "│" stays aligned.
+// renderTableRow 渲染表格的一行，当单元格内容超出列宽时会跨多行显示。
+// 整行的视觉高度等于所有单元格中最大的换行行数，内容不足的单元格用空格填充以保持对齐。
 func (r *mdRenderer) renderTableRow(buf *strings.Builder, prefix, sep string, cells []string, widths []int, isHeader bool) {
 	cols := len(widths)
 	wrapped := make([][]string, cols)
@@ -483,8 +501,7 @@ func (r *mdRenderer) renderTableRow(buf *strings.Builder, prefix, sep string, ce
 	}
 }
 
-// collectCells walks a TableHeader / TableRow node and pulls each TableCell's
-// inline content as an ANSI-styled string. Non-cell children are ignored.
+// collectCells 遍历表头或表行节点，提取每个单元格的行内内容为 ANSI 样式字符串。
 func (r *mdRenderer) collectCells(parent ast.Node, src []byte) []string {
 	var out []string
 	for c := parent.FirstChild(); c != nil; c = c.NextSibling() {
@@ -495,9 +512,8 @@ func (r *mdRenderer) collectCells(parent ast.Node, src []byte) []string {
 	return out
 }
 
-// inlineCarrier returns n when it's a paragraph or text-block (both hold
-// inline runs), else nil. Used by list rendering so the marker line gets the
-// inline content regardless of whether the list is tight or loose.
+// inlineCarrier 判断节点是否为段落或文本块（两者都持有行内内容）。
+// 用于列表渲染，确保无论列表是紧凑还是松散格式，标记行都能获取到行内内容。
 func inlineCarrier(n ast.Node) ast.Node {
 	switch n.(type) {
 	case *ast.Paragraph, *ast.TextBlock:
@@ -506,10 +522,10 @@ func inlineCarrier(n ast.Node) ast.Node {
 	return nil
 }
 
-// wrapAnsi word-wraps text to width columns, hard-breaking any single word too
-// wide to fit on its own line — the path CJK takes, having no inter-word spaces.
-// ANSI SGR escapes are preserved and counted as zero width; wide chars count as
-// two columns. Thin wrapper over x/ansi's Wrap (already in the dep tree).
+// wrapAnsi 将文本按指定列宽进行自动换行。
+// 对于无法在单行内放下的长词（如 CJK 文本无空格分隔）会强制断行。
+// ANSI SGR 转义码被保留且不计入宽度，宽字符计为两列。
+// 底层使用 x/ansi 库的 Wrap 函数实现。
 func wrapAnsi(text string, width int) string {
 	if width < 4 {
 		width = 4

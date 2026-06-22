@@ -1,3 +1,13 @@
+// 文件：attachments.go
+//
+// 附件管理——图片和文件附件的保存、读取和剪贴板集成。
+// 支持多种附件来源：
+//   - DataURL: 浏览器拖放/粘贴的 base64 编码数据
+//   - 文件路径: 本地文件系统中的图片/文件
+//   - 剪贴板: macOS (osascript)、Windows (PowerShell)、Linux (wl-paste/xclip)
+//
+// 所有附件存储在 .reasonix/attachments/ 目录下，使用时间戳+序列号命名。
+// 安全措施包括：符号链接检测、路径清理、大小限制、MIME 类型验证。
 package control
 
 import (

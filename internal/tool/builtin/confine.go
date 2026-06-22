@@ -11,9 +11,9 @@ import (
 	"reasonix/internal/tool"
 )
 
-// ConfineBash returns the bash built-in bound to an OS-sandbox spec, overriding
-// the unconfined instance registered at init. When the spec enforces, bash runs
-// each command through the sandbox (see package sandbox).
+// ConfineBash 返回绑定了 OS 沙箱规范的 bash 内置工具，覆盖 init 注册的无限制实例。
+// 当 spec 启用沙箱时，bash 通过沙箱执行每个命令。
+// 可选的 timeout 参数设置前台命令的超时时间。
 func ConfineBash(spec sandbox.Spec, timeout ...time.Duration) tool.Tool {
 	shell := spec.Shell
 	if shell.Path == "" {
@@ -26,18 +26,17 @@ func ConfineBash(spec sandbox.Spec, timeout ...time.Duration) tool.Tool {
 	return b
 }
 
-// ConfineWebFetch returns the web_fetch built-in bound to Reasonix proxy
-// settings while preserving its SSRF-guarded dialer.
+// ConfineWebFetch 返回绑定了代理设置的 web_fetch 内置工具，同时保留 SSRF 防护。
 func ConfineWebFetch(proxySpec netclient.ProxySpec) tool.Tool {
 	return webFetch{proxySpec: proxySpec}
 }
 
-// ConfineWriters returns the file-writing built-ins (write_file, edit_file,
-// multi_edit, move_file, notebook_edit) bound to roots — the only directories they may
-// modify. The composition root adds these to the per-run registry to override
-// the unconfined instances registered at init time, so writes stay inside the
-// workspace by default. roots may be relative; they are resolved to absolute,
-// symlink-free paths once here. An empty roots slice yields unconfined writers.
+// ConfineWriters 返回绑定了工作区边界的文件写入内置工具集合。
+// 包括 write_file、edit_file、multi_edit、move_file、notebook_edit、delete_range、delete_symbol。
+//
+// roots 是唯一允许修改的目录列表。组合根（composition root）将这些工具添加到
+// 每次运行的注册表中，覆盖 init 时注册的无限制实例，使写入默认限制在工作区内。
+// roots 可以是相对路径，在此处解析为绝对路径。空 roots 表示无限制。
 func ConfineWriters(roots []string) []tool.Tool {
 	rs := realRoots(roots)
 	return []tool.Tool{
@@ -64,10 +63,9 @@ func realRoots(roots []string) []string {
 	return out
 }
 
-// confine reports an error when target resolves outside every root. An empty
-// roots slice is unconfined (returns nil) — the safe default for the built-in
-// templates before a run configures the workspace. The error text is written
-// for the model: it names the boundary and how the user can widen it.
+// confine 检查目标路径是否在允许的根目录内，不在则返回错误。
+// 空 roots 表示无限制（返回 nil）— 这是运行前配置工作区之前的安全默认值。
+// 错误信息面向模型编写：指出边界和如何扩大范围。
 func confine(roots []string, target string) error {
 	if len(roots) == 0 {
 		return nil
@@ -86,10 +84,10 @@ func confine(roots []string, target string) error {
 		target, strings.Join(roots, ", "))
 }
 
-// realPath resolves path to an absolute, symlink-free form. Because a write
-// target need not exist yet (write_file creates it), it resolves the deepest
-// existing ancestor with EvalSymlinks and re-appends the not-yet-existing tail.
-// This stops a symlinked directory from smuggling a write outside a root.
+// realPath 将路径解析为绝对、无符号链接的形式。
+// 因为写入目标可能尚不存在（write_file 会创建它），所以对最深的已存在祖先
+// 使用 EvalSymlinks，然后重新附加尚不存在的尾部路径。
+// 这防止了通过符号链接目录将写入操作走私到根目录之外。
 func realPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -111,10 +109,10 @@ func realPath(path string) (string, error) {
 	}
 }
 
-// within reports whether path is at or below root. Both must be absolute,
-// cleaned, symlink-free. It uses filepath.Rel so it is correct across volumes
-// and is not fooled by a prefix that only matches a partial path component
-// (e.g. /work-other is not within /work).
+// within 报告 path 是否在 root 下或与 root 相同。
+// 两者必须是绝对、已清理、无符号链接的路径。
+// 使用 filepath.Rel 确保跨卷正确性，不会被仅匹配部分路径组件的前缀欺骗
+//（例如 /work-other 不在 /work 内）。
 func within(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {

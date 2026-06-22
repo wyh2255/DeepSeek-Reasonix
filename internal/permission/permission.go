@@ -1,8 +1,18 @@
-// Package permission decides, per tool call, whether to allow it, deny it, or
-// ask the user first. The core is a pure Policy (rule evaluation, no I/O); a
-// Gate wraps a Policy with an optional interactive Approver and is what the
-// agent consults at execute time. Keeping rule evaluation pure makes it
-// trivially testable and keeps the agent independent of how "ask" is resolved.
+// Package permission 实现了工具调用的权限控制系统。
+//
+// 每次工具调用时，权限系统决定是放行（Allow）、拒绝（Deny）还是询问用户（Ask）。
+//
+// 架构设计：
+//   - Policy（策略）：纯规则评估层，无 I/O，可独立测试
+//   - Gate（门控）：Policy + 可选的交互式 Approver，是 Agent 在执行时实际咨询的对象
+//   - Approver（审批者）：由前端（如 TUI）实现，负责向用户展示审批界面
+//
+// 三种审批模式：
+//   - ask：每次工具调用都需要用户确认
+//   - auto：自动批准只读工具，写入工具需要确认
+//   - yolo：全部自动批准（不推荐生产使用）
+//
+// 规则优先级：deny > ask > allow > 回退默认值（只读工具默认 Allow，写入工具使用模式默认值）
 package permission
 
 import (
@@ -11,15 +21,15 @@ import (
 	"strings"
 )
 
-// Decision is the outcome of evaluating a tool call against a Policy.
+// Decision 是工具调用经过策略评估后的决策结果。
 type Decision int
 
 const (
-	// Allow runs the tool without prompting.
+	// Allow 表示允许执行工具，无需用户确认。
 	Allow Decision = iota
-	// Ask defers to an interactive Approver (or, with none, resolves to Allow).
+	// Ask 表示需要交互式 Approver 来决定（非交互模式下等同于 Allow）。
 	Ask
-	// Deny blocks the tool in every mode.
+	// Deny 表示拒绝执行工具，在所有模式下都会阻止。
 	Deny
 )
 
@@ -36,8 +46,8 @@ func (d Decision) String() string {
 	}
 }
 
-// ParseDecision maps a config string to a Decision. Unknown / empty input
-// defaults to Ask — the conservative posture for a writer fallback.
+// ParseDecision 将配置字符串映射为 Decision 枚举值。
+// 未知或空输入默认为 Ask — 这是写入工具的保守默认策略。
 func ParseDecision(s string) Decision {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "allow":
@@ -49,26 +59,32 @@ func ParseDecision(s string) Decision {
 	}
 }
 
-// Rule matches tool calls. Tool is the tool name; Subject, when non-empty,
-// constrains the call's subject. A glob Subject (see matchGlob) matches by
-// wildcard; a Literal Subject matches by exact string equality. An empty Subject
-// matches every call to Tool.
+// Rule 表示一条权限匹配规则，用于匹配工具调用。
+//
+// 字段说明：
+//   - Tool: 工具名称（如 "bash", "edit_file"），或特殊值 "file_mutation" 匹配所有写入工具
+//   - Subject: 匹配约束（如文件路径、命令内容）。为空时匹配该工具的所有调用
+//   - Literal: 为 true 时按精确字符串匹配 Subject（'*' 和 '?' 视为普通字符），
+//     为 false 时作为通配符 glob 匹配
 type Rule struct {
-	Tool    string
-	Subject string
-	// Literal matches Subject by exact equality rather than as a glob, so a
-	// remembered concrete command keeps any '*'/'?' as ordinary characters
-	// instead of turning them into wildcards.
+	Tool    string // 工具名称
+	Subject string // 匹配约束（路径、命令等），为空则匹配所有
+	// Literal 控制 Subject 的匹配模式：
+	//   true  = 精确匹配（已记忆的具体命令中的 '*'/'?' 保持字面含义）
+	//   false = glob 通配符匹配（'*' 匹配任意字符序列，'?' 匹配单个字符）
 	Literal bool
 }
 
-// ParseRule parses "ToolName", "ToolName(glob)", or the legacy
-// "ToolName=literal" form. Surrounding whitespace is trimmed. The "=literal"
-// form (taken when the '=' precedes any '(') matches the rest of the string
-// verbatim — no globbing — and is kept for existing configs that were written
-// before the Claude Code-style Tool(specifier) approval rules. ok is false for
-// a malformed entry (empty tool name) so the caller can warn rather than
-// silently install a rule that matches nothing.
+// ParseRule 解析规则字符串，支持三种格式：
+//
+//   - "ToolName"：匹配该工具的所有调用（无 Subject 约束）
+//   - "ToolName(glob)"：匹配该工具中 Subject 与 glob 匹配的调用
+//   - "ToolName=literal"：旧格式，精确匹配 Subject（不进行 glob 展开）
+//
+// "=literal" 格式（当 '=' 出现在 '(' 之前时）保持向后兼容，
+// 用于在 Claude Code 风格的 Tool(specifier) 规则出现之前编写的配置。
+//
+// 返回 ok=false 表示格式错误（工具名为空），调用者应发出警告而非静默安装无效规则。
 func ParseRule(s string) (Rule, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -103,19 +119,25 @@ func parseRules(ss []string) []Rule {
 	return out
 }
 
-// Policy is a set of rules plus the writer fallback mode. It is the pure,
-// I/O-free heart of the permission layer.
+// Policy 是权限系统的核心，包含一组规则和写入工具的回退模式。
+// 它是纯规则评估层，无 I/O 操作，可独立测试。
+//
+// 字段说明：
+//   - Mode: 当没有规则匹配时，写入工具的回退决策。只读工具始终回退为 Allow
+//   - Allow: 放行规则列表
+//   - Ask: 询问用户规则列表
+//   - Deny: 拒绝规则列表
+//
+// 评估优先级：deny > ask > allow > 回退默认值
 type Policy struct {
-	// Mode is the fallback decision for writer tools when no rule matches.
-	// Read-only tools always fall back to Allow.
-	Mode  Decision
-	Allow []Rule
-	Ask   []Rule
-	Deny  []Rule
+	Mode  Decision // 写入工具无规则匹配时的回退决策
+	Allow []Rule   // 放行规则
+	Ask   []Rule   // 询问规则
+	Deny  []Rule   // 拒绝规则
 }
 
-// New builds a Policy from config string slices and a mode string ("ask" by
-// default). Malformed rule strings are dropped.
+// New 从配置字符串切片和模式字符串构建 Policy。
+// mode 默认为 "ask"。格式错误的规则字符串会被静默丢弃。
 func New(mode string, allow, ask, deny []string) Policy {
 	return Policy{
 		Mode:  ParseDecision(mode),
@@ -125,18 +147,22 @@ func New(mode string, allow, ask, deny []string) Policy {
 	}
 }
 
-// Decide evaluates a tool call. readOnly is the tool's own classification; args
-// is the raw JSON the model sent, from which the call's subject is extracted
-// for glob matching. Calls with multiple subjects, such as move_file's source
-// and destination paths, must be safe for every subject before the call is
-// allowed. Precedence: deny > ask > allow > fallback (Allow for readers, Mode
-// for writers).
+// Decide 评估一次工具调用的权限决策。
+//
+// 参数：
+//   - toolName: 工具名称
+//   - readOnly: 工具自身的只读分类
+//   - args: 模型发送的原始 JSON 参数，用于提取 Subject 进行 glob 匹配
+//
+// 对于有多个 Subject 的调用（如 move_file 的源路径和目标路径），
+// 必须每个 Subject 都安全才允许执行。
+//
+// 评估优先级：deny > ask > allow > 回退默认值（只读工具为 Allow，写入工具为 Mode）
 func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Decision {
 	return p.DecideSubjects(toolName, readOnly, Subjects(args))
 }
 
-// DecideSubject evaluates a tool call when the caller already extracted the
-// stable approval subject from args.
+// DecideSubject 评估工具调用权限，调用者已从参数中提取了稳定的审批 Subject。
 func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) Decision {
 	switch {
 	case matchAny(p.Deny, toolName, subject):
@@ -152,10 +178,12 @@ func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) De
 	}
 }
 
-// DecideSubjects evaluates a tool call against every subject the call touches.
-// This keeps two-path operations honest: a move is denied if either endpoint is
-// denied, asks if either endpoint requires approval, and is allowed only when
-// every endpoint is allowed under the same policy.
+// DecideSubjects 评估工具调用涉及的每个 Subject 的权限。
+//
+// 这确保了双路径操作（如 move_file）的正确性：
+//   - 任一端点被拒绝 → 整个操作被拒绝
+//   - 任一端点需要询问 → 整个操作需要询问
+//   - 所有端点都被允许 → 整个操作被允许
 func (p Policy) DecideSubjects(toolName string, readOnly bool, subjects []string) Decision {
 	if len(subjects) == 0 {
 		return p.DecideSubject(toolName, readOnly, "")
@@ -172,8 +200,8 @@ func (p Policy) DecideSubjects(toolName string, readOnly bool, subjects []string
 	return out
 }
 
-// matchAny reports whether any rule matches the (toolName, subject) pair. A
-// subject-specific rule cannot match a call that exposes no subject.
+// matchAny 检查规则列表中是否有任何规则匹配给定的 (toolName, subject) 对。
+// 带 Subject 的规则无法匹配不暴露 Subject 的调用。
 func matchAny(rules []Rule, toolName, subject string) bool {
 	for _, r := range rules {
 		if !ruleToolMatches(r.Tool, toolName) {
@@ -192,18 +220,16 @@ func matchAny(rules []Rule, toolName, subject string) bool {
 	return false
 }
 
-// RuleMatchesString reports whether one config-style rule string matches the
-// given tool subject. It is used for session grants as well as persisted config
-// rules so both paths share identical matching semantics.
+// RuleMatchesString 判断一个配置风格的规则字符串是否匹配给定的工具主题。
+// 用于会话授权和持久化配置规则，使两条路径共享相同的匹配语义。
 func RuleMatchesString(rule, toolName, subject string) bool {
 	r, ok := ParseRule(rule)
 	return ok && matchAny([]Rule{r}, toolName, subject)
 }
 
-// RuleCoversString reports whether every call represented by candidate is
-// already covered by existing. It intentionally proves only the cases Reasonix
-// creates automatically: exact rules covered by broader globs or bare tool
-// rules, exact duplicate globs, and bare tool rules covering subject rules.
+// RuleCoversString 判断 existing 规则是否已覆盖 candidate 规则所代表的所有调用。
+// 仅验证 Reasonix 自动创建的场景：精确规则被更宽泛的 glob 或裸工具规则覆盖、
+// 完全重复的 glob、以及裸工具规则覆盖带主题的规则。
 func RuleCoversString(existing, candidate string) bool {
 	a, ok := ParseRule(existing)
 	if !ok {
@@ -247,16 +273,14 @@ func bashRulePrefixBaseMatches(existing, candidate Rule) bool {
 	return ok && existingBase == candidateBase
 }
 
-// subjectKeys are the JSON argument keys, in priority order, that carry a tool
-// call's "subject" — the thing a Subject glob matches against. Generic so tools
-// need not implement a permission-specific method: bash exposes command, the
-// file tools expose path / file_path, grep & glob expose pattern.
+// subjectKeys 是按优先级排列的 JSON 参数键，携带工具调用的"主题"——
+// Subject glob 匹配的目标。设计为通用的，使工具无需实现权限专用方法：
+// bash 暴露 command，文件工具暴露 path / file_path，grep 和 glob 暴露 pattern。
 var subjectKeys = []string{"command", "file_path", "path", "source_path", "destination_path", "pattern"}
 
-// Subject extracts the primary matchable subject string from a call's raw JSON
-// args, returning "" when none of the known keys is present (such a call only
-// matches bare "ToolName" rules). Use Subjects for permission decisions that
-// must account for every touched endpoint.
+// Subject 从调用的原始 JSON 参数中提取主要可匹配的主题字符串，
+// 当没有已知键存在时返回 ""（此类调用仅匹配裸 "ToolName" 规则）。
+// 对于需要考虑每个涉及端点的权限决策，请使用 Subjects。
 func Subject(args json.RawMessage) string {
 	subjects := Subjects(args)
 	if len(subjects) > 0 {
@@ -265,9 +289,9 @@ func Subject(args json.RawMessage) string {
 	return ""
 }
 
-// Subjects extracts every matchable subject from a call's raw JSON args. Most
-// tools expose one subject; move_file exposes both source_path and
-// destination_path so path-scoped permission rules can protect either endpoint.
+// Subjects 从调用的原始 JSON 参数中提取所有可匹配的主题。
+// 大多数工具暴露一个主题；move_file 同时暴露 source_path 和 destination_path，
+// 使路径范围的权限规则可以保护任一端点。
 func Subjects(args json.RawMessage) []string {
 	if len(args) == 0 {
 		return nil
@@ -302,11 +326,10 @@ func stringArg(m map[string]any, key string) string {
 	return ""
 }
 
-// matchGlob reports whether name matches pattern, where '*' matches any run of
-// characters (including separators) and '?' matches exactly one. Unlike
-// path.Match, '*' is not stopped by '/', which is what command-line and path
-// prefixes ("rm -rf*", "/etc/*") intuitively expect. Linear time with
-// backtracking, byte-oriented.
+// matchGlob 判断 name 是否匹配 pattern，其中 '*' 匹配任意字符序列（包括分隔符），
+// '?' 匹配恰好一个字符。与 path.Match 不同，'*' 不会被 '/' 阻止，
+// 这是命令行和路径前缀（如 "rm -rf*"、"/etc/*"）的直觉预期。
+// 线性时间带回溯，面向字节。
 func matchGlob(pattern, name string) bool {
 	var px, nx, starPx, starNx int
 	starPx = -1
@@ -333,33 +356,45 @@ func matchGlob(pattern, name string) bool {
 	return px == len(pattern)
 }
 
-// Approver resolves an Ask decision interactively. Implementations live in the
-// front-end (the chat TUI); a non-interactive run passes a nil Approver, which
-// the Gate treats as "allow" to preserve autonomous behaviour.
+// Approver 是交互式审批接口，用于解决 Ask 决策。
+// 实现位于前端（如 TUI 聊天界面）；非交互模式传入 nil，Gate 会将其视为 "允许"。
 type Approver interface {
-	// Approve asks the user about a pending call. It returns whether to allow
-	// it and whether to remember that choice as a new rule. A non-nil err (e.g.
-	// the context was cancelled while waiting) aborts the turn.
+	// Approve 向用户询问是否允许一个待处理的工具调用。
+	//
+	// 返回值：
+	//   - allow: 是否允许执行
+	//   - remember: 是否将此选择记忆为新规则（"始终允许"）
+	//   - err: 非 nil 错误（如等待期间 context 被取消）会中止本轮
 	Approve(ctx context.Context, toolName, subject string, args json.RawMessage) (allow, remember bool, err error)
 }
 
-// Gate is what the agent consults at execute time: a Policy plus an optional
-// Approver. It satisfies the agent's Gate interface structurally.
+// Gate 是 Agent 在执行时实际咨询的权限门控：Policy + 可选的 Approver。
+// 它结构化地满足 Agent 的 Gate 接口。
 type Gate struct {
-	Policy   Policy
-	Approver Approver
+	Policy   Policy    // 纯规则评估策略
+	Approver Approver  // 交互式审批器（非交互模式为 nil）
 
-	// OnRemember, when set, is invoked with a new allow rule the user chose to
-	// remember (e.g. "Bash(go build)"), so the front-end can persist it.
+	// OnRemember 当用户选择 "始终允许" 时被调用，传递新规则字符串（如 "Bash(go build)"），
+	// 以便前端持久化该规则到配置文件。
 	OnRemember func(rule string)
 }
 
-// NewGate wires a Policy to an Approver (nil for non-interactive use).
+// NewGate 将 Policy 与 Approver 组合为 Gate。非交互模式下 Approver 传 nil。
 func NewGate(p Policy, a Approver) *Gate { return &Gate{Policy: p, Approver: a} }
 
-// Check decides whether a tool call may run. It is the method the agent's Gate
-// interface expects. A denied or refused call returns allow=false with a short
-// reason the agent feeds back to the model.
+// Check 决定一个工具调用是否可以执行。这是 Agent 的 Gate 接口期望的方法。
+//
+// 处理流程：
+//  1. 对 bash 工具进行只读命令检测（如 "ls", "git status" 等被视为只读）
+//  2. 通过 Policy.Decide 评估权限
+//  3. Deny：直接拒绝，返回拒绝原因
+//  4. Ask：如果有 Approver 则交互询问；无 Approver 则放行（保持自主性）
+//  5. Allow：直接放行
+//
+// 返回值：
+//   - allow: 是否允许执行
+//   - reason: 拒绝或用户拒绝时的原因描述，供模型理解
+//   - err: 审批过程中的错误（如 context 取消）
 func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (bool, string, error) {
 	if toolName == "bash" && !readOnly {
 		subject := Subject(args)
@@ -402,21 +437,22 @@ func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage,
 	}
 }
 
-// rememberRule builds the rule string persisted when the user picks "always
-// allow". Bash commands prefer a safe command prefix (e.g. go test:*) so
-// "always allow" covers similar invocations with different arguments. File
-// mutation tools are remembered tool-wide ("Edit") so approving one file edit
-// covers all files. Other tools are remembered by tool name. Deny and ask rules keep their higher precedence.
+// rememberRule 构建用户选择 "始终允许" 时持久化的规则字符串。
+//
+// 策略：
+//   - bash 命令：优先使用安全的命令前缀（如 "go test:*"），
+//     使 "始终允许" 覆盖使用不同参数的类似调用
+//   - 文件写入工具：按工具名记忆（"Edit"），批准一个文件编辑即覆盖所有文件
+//   - 其他工具：按工具名记忆
+//   - deny 和 ask 规则始终保持更高优先级
 func rememberRule(toolName, subject string) string {
 	return RememberRuleForScope(toolName, subject)
 }
 
-// RememberRuleForScope builds the rule string persisted when the user chooses
-// an always-allow option. Bash commands prefer a safe prefix (go test:*) so
-// similar invocations (different search terms, different test packages) match;
-// when no safe prefix can be extracted the exact command is used. File
-// mutation tools are always remembered tool-wide (Edit). Other tools use their
-// bare tool name. Deny rules still take precedence on every call.
+// RememberRuleForScope 构建用户选择"始终允许"时持久化的规则字符串。
+// bash 命令优先使用安全前缀（如 "go test:*"），使类似调用（不同搜索词、不同测试包）匹配；
+// 无法提取安全前缀时使用精确命令。文件写入工具始终按工具名记忆（Edit）。
+// 其他工具使用裸工具名。deny 规则在每次调用时仍然优先。
 func RememberRuleForScope(toolName, subject string) string {
 	subject = strings.TrimSpace(subject)
 	if subject != "" && toolName == "bash" {
@@ -431,16 +467,14 @@ func RememberRuleForScope(toolName, subject string) string {
 	return toolName
 }
 
-// SessionGrantKey returns the in-memory rule for "allow this session". Bash
-// prefers a command prefix when one is available, falling back to the exact
-// command when unsafe. File mutation tools share a single Edit grant.
+// SessionGrantKey 返回"本会话允许"的内存规则。
+// bash 优先使用命令前缀，不安全时回退到精确命令。文件写入工具共享单个 Edit 授权。
 func SessionGrantKey(toolName, subject string) string {
 	return SessionGrantRuleForScope(toolName, subject)
 }
 
-// SessionGrantRuleForScope returns the in-memory rule for a session grant.
-// Bash prefers a command prefix when one is available; file mutation tools
-// share a single Edit grant; all other tools return the bare tool name.
+// SessionGrantRuleForScope 返回会话授权的内存规则。
+// bash 优先使用命令前缀；文件写入工具共享单个 Edit 授权；其他工具返回裸工具名。
 func SessionGrantRuleForScope(toolName, subject string) string {
 	subject = strings.TrimSpace(subject)
 	if toolName == "bash" && subject != "" {
@@ -455,10 +489,13 @@ func SessionGrantRuleForScope(toolName, subject string) string {
 	return toolName
 }
 
-// BashCommandPrefix returns a conservative prefix rule for "similar command"
-// approvals. It avoids shell syntax and keeps the prefix at command-word
-// boundaries, so approving "go test ./..." grants "go test:*" rather than a
-// broader "go *".
+// BashCommandPrefix 为 bash 命令生成保守的前缀规则，用于"类似命令"的审批。
+//
+// 规则：
+//   - 避免 shell 语法（管道、重定向等）
+//   - 保持前缀在命令词边界，例如 "go test ./..." 生成 "go test:*" 而非更宽泛的 "go *"
+//   - 包管理器的 "run" 子命令保留三段前缀（如 "npm run build:*"）
+//   - 危险命令不生成前缀规则
 func BashCommandPrefix(subject string) string {
 	cmd := strings.TrimSpace(subject)
 	if cmd == "" || containsShellSyntax(cmd) {
@@ -487,7 +524,7 @@ func isPackageManagerRun(base string) bool {
 	}
 }
 
-// IsFileMutationTool reports whether a built-in tool mutates workspace files.
+// IsFileMutationTool 判断内置工具是否会修改工作区文件。
 func IsFileMutationTool(toolName string) bool {
 	switch toolName {
 	case "write_file", "edit_file", "multi_edit", "move_file", "notebook_edit", "delete_range", "delete_symbol":

@@ -1,3 +1,11 @@
+// complete.go 实现了 CLI 输入框的自动补全菜单系统。
+// 支持三种补全模式：
+//   - 斜杠命令补全（compSlash）: 输入 "/" 时触发，补全命令名称
+//   - 斜杠命令参数补全（compSlashArg）: 命令后的结构化参数补全
+//   - @ 引用补全（compAt）: 输入 "@" 时触发，补全文件路径和 MCP 资源
+//
+// 补全菜单使用模糊匹配算法，支持子序列匹配和前缀优先排序。
+
 package cli
 
 import (
@@ -27,6 +35,9 @@ const (
 // compItem is one menu row: label shown, insert applied on accept, hint dimmed.
 // descend marks a directory entry — accepting it fills the input and re-opens
 // the menu one level deeper instead of closing.
+// compItem 表示补全菜单中的一行条目。
+// label 为显示文本，insert 为选中后插入的内容，hint 为暗色提示信息。
+// descend 标记该条目是否为目录（选中后会展开下一级而非关闭菜单）。
 type compItem struct {
 	label   string
 	insert  string
@@ -37,6 +48,8 @@ type compItem struct {
 // completion is the live autocomplete menu state. Empty value = inactive.
 // replaceFrom is the byte offset in the input where the completed token starts
 // (0 for a slash line, the '@' index for an @-reference).
+// completion 表示当前活跃的补全菜单状态。
+// 空值表示菜单未激活。replaceFrom 记录补全替换的起始字节偏移量。
 type completion struct {
 	active      bool
 	kind        compKind
@@ -113,6 +126,9 @@ func (m *chatTUI) slashItems() []compItem {
 // updateCompletion recomputes the menu from the current input: a slash menu
 // while the line is a single "/word" token, or an @-reference menu while the
 // token under the cursor is "@…".
+// updateCompletion 根据当前输入内容重新计算补全菜单。
+// 优先检查 @ 引用 token，然后检查斜杠命令及其参数。
+// 当输入不匹配任何补全模式时关闭菜单。
 func (m *chatTUI) updateCompletion() {
 	val := m.input.Value()
 
@@ -155,6 +171,9 @@ func (m *chatTUI) updateCompletion() {
 // anything applied. Only commands with structured arguments participate —
 // currently /mcp; custom commands and MCP prompts take free-form template args,
 // so they yield nothing.
+// slashArgItems 为斜杠命令的参数提供补全项。
+// 委托给各个具体的参数补全函数（分支、resume、主题等），
+// 最后通过共享的 control.SlashArgItems 逻辑处理通用参数。
 func (m *chatTUI) slashArgItems(val string) ([]compItem, int, bool) {
 	if items, from, ok := m.branchArgItems(val); ok {
 		return items, from, len(items) > 0
@@ -176,6 +195,8 @@ func (m *chatTUI) slashArgItems(val string) ([]compItem, int, bool) {
 	return slashItemsToComps(items), from, true
 }
 
+// slashArgData 构建斜杠命令参数补全所需的数据集合。
+// 包含当前技能列表、模型引用、提供商名称、MCP 服务器名等信息。
 func (m *chatTUI) slashArgData() control.ArgData {
 	curProvider := ""
 	if parts := strings.SplitN(m.modelRef, "/", 2); len(parts) == 2 {
@@ -199,6 +220,8 @@ func (m *chatTUI) slashArgData() control.ArgData {
 	return data
 }
 
+// explicitSubcommandItems 处理以 "?" 结尾的显式子命令补全请求。
+// 例如输入 "/mcp?" 会显示 mcp 的所有子命令选项。
 func (m *chatTUI) explicitSubcommandItems(val string) ([]compItem, int, bool) {
 	cmd, ok := strings.CutSuffix(val, "?")
 	if !ok {
@@ -220,6 +243,8 @@ func (m *chatTUI) explicitSubcommandItems(val string) ([]compItem, int, bool) {
 	return out, len(cmd), true
 }
 
+// bareSubcommandSpace 判断输入是否为某个子命令后仅跟空白字符的状态。
+// 用于在特定命令（如 /mcp、/skills）后关闭补全菜单，避免干扰。
 func (m *chatTUI) bareSubcommandSpace(val string) bool {
 	if !strings.ContainsAny(val, " \t") || strings.TrimRight(val, " \t") == val {
 		return false
@@ -236,6 +261,7 @@ func (m *chatTUI) bareSubcommandSpace(val string) bool {
 	}
 }
 
+// slashItemsToComps 将通用的 SlashItem 切片转换为 CLI 专用的 compItem 切片。
 func slashItemsToComps(items []control.SlashItem) []compItem {
 	out := make([]compItem, len(items))
 	for i, it := range items {
@@ -244,6 +270,8 @@ func slashItemsToComps(items []control.SlashItem) []compItem {
 	return out
 }
 
+// branchArgItems 为 /switch 命令提供分支名称/ID 的补全项。
+// 根据用户输入的前缀过滤匹配的分支，显示分支的回合数和预览信息。
 func (m *chatTUI) branchArgItems(val string) ([]compItem, int, bool) {
 	cmdEnd := strings.IndexAny(val, " \t")
 	if cmdEnd < 0 || val[:cmdEnd] != "/switch" {
@@ -529,6 +557,7 @@ func (m *chatTUI) resourceItems(server, frag string) []compItem {
 }
 
 // moveCompletion advances the selection by delta, wrapping around.
+// moveCompletion 将补全菜单的选择光标移动指定的偏移量，支持循环滚动。
 func (m *chatTUI) moveCompletion(delta int) {
 	n := len(m.completion.items)
 	if n == 0 {
@@ -537,6 +566,8 @@ func (m *chatTUI) moveCompletion(delta int) {
 	m.completion.sel = ((m.completion.sel+delta)%n + n) % n
 }
 
+// completionExactLabel 判断当前输入值是否与选中的补全项标签完全匹配。
+// 用于判断是否应关闭补全菜单（避免重复选中同一项）。
 func (m *chatTUI) completionExactLabel() bool {
 	if !m.completion.active || m.completion.sel >= len(m.completion.items) {
 		return false
@@ -545,6 +576,8 @@ func (m *chatTUI) completionExactLabel() bool {
 	return val == m.completion.items[m.completion.sel].label
 }
 
+// completionBareOverlayCommand 判断当前输入是否为需要覆盖显示的裸命令。
+// 当输入仅为 "/mcp" 或 "/skills" 时返回 true。
 func (m *chatTUI) completionBareOverlayCommand() bool {
 	switch strings.TrimSpace(m.input.Value()) {
 	case "/mcp", "/skills":
@@ -554,6 +587,8 @@ func (m *chatTUI) completionBareOverlayCommand() bool {
 	}
 }
 
+// completionSelectedInsertPresent 判断选中补全项的插入文本是否已存在于输入中。
+// 用于避免重复插入相同内容。
 func (m *chatTUI) completionSelectedInsertPresent() bool {
 	if !m.completion.active || m.completion.sel >= len(m.completion.items) {
 		return false
@@ -582,13 +617,14 @@ func (m *chatTUI) acceptCompletion() {
 	m.input.SetValue(val[:rf] + it.insert)
 	m.input.CursorEnd()
 	if it.descend || strings.HasSuffix(it.insert, " ") {
+		// 目录项或以空格结尾的项：重新计算补全以展开下一级
 		m.updateCompletion()
 		return
 	}
-	m.updateCompletion() // re-filter for arg completion (e.g. /resume → numbered sessions)
-	// If the completion re-opened with the same single item the user just
-	// selected (i.e. the token was already typed), close it so the next Enter
-	// submits the command rather than being captured again by acceptCompletion.
+	// 重新过滤以支持参数补全（如 /resume 后的编号会话列表）
+	m.updateCompletion()
+	// 如果补全重新打开且仅剩用户刚选中的同一项（即 token 已完整输入），
+	// 则关闭菜单，使下一次 Enter 能提交命令而非再次被补全拦截。
 	if m.completion.active && len(m.completion.items) == 1 {
 		tok := m.input.Value()[m.completion.replaceFrom:]
 		if tok == m.completion.items[0].insert {
@@ -597,6 +633,7 @@ func (m *chatTUI) acceptCompletion() {
 	}
 }
 
+// compSelStyle 是补全菜单选中项的样式（反色显示）。
 var compSelStyle lipgloss.Style
 
 const completionPadCell = "\u00a0"
@@ -619,6 +656,9 @@ func padCompletionLine(s string, w int) string {
 // has no ordinary trailing-space run to collapse into EL/ECH erase sequences.
 // That avoids ghost cells on terminals (mintty) with unreliable erases after
 // wide CJK glyphs.
+// renderCompletion 渲染补全菜单，显示在输入框上方。
+// 使用窗口化显示（最多 maxCompRows 行），当前选中项高亮。
+// 每行使用 NBSP 填充以避免某些终端的擦除问题。
 func (m chatTUI) renderCompletion() string {
 	if !m.completion.active || len(m.completion.items) == 0 {
 		return ""

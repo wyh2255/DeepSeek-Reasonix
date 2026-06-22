@@ -1,3 +1,12 @@
+// 文件：slash.go
+//
+// 斜杠命令管理——命令补全、参数建议和管理命令处理。
+// 本文件包含：
+//   - SlashItem/ArgData: 斜杠补全建议的数据结构
+//   - SlashArgItems: 参数补全的统一入口（CLI 和桌面共享）
+//   - filterSlash: 过滤补全建议（前缀匹配 + 去除无操作建议）
+//   - managementNotice: 管理斜杠命令的处理（/model、/memory、/skills 等）
+//   - 各命令的列表文本生成（modelListText、mcpListText 等）
 package control
 
 import (
@@ -14,31 +23,29 @@ import (
 	"reasonix/internal/skill"
 )
 
-// SlashItem is one slash-completion suggestion. Insert is the token text placed
-// at the current argument position (callers replace from the token's start, see
-// SlashArgItems' returned offset); Descend hints the menu to re-open one level
-// deeper after accepting (e.g. "/mcp " → "/mcp add ").
+// SlashItem 是一个斜杠补全建议项。Insert 是放置在当前位置的令牌文本
+//（调用者从令牌的起始位置替换，参见 SlashArgItems 返回的偏移量）；
+// Descend 提示菜单在接受后重新打开更深一层（如 "/mcp " → "/mcp add "）。
 type SlashItem struct {
-	Label   string `json:"label"`
-	Insert  string `json:"insert"`
-	Hint    string `json:"hint"`
-	Descend bool   `json:"descend"`
+	Label   string `json:"label"`   // 显示标签（如 "add"、"connect"）
+	Insert  string `json:"insert"`  // 插入的文本（如 "add "，注意尾部空格触发下一级）
+	Hint    string `json:"hint"`    // 提示说明（如 "Streamable HTTP URL"）
+	Descend bool   `json:"descend"` // 是否提示菜单在选择后展开下一级
 }
 
-// ArgData supplies the dynamic data SlashArgItems needs, so the completion logic
-// is one shared function both frontends call with their own session data — the
-// chat TUI (controller-free, from its cached lists) and the desktop (from the
-// controller). This keeps the CLI and desktop sub-command hints identical.
+// ArgData 提供 SlashArgItems 所需的动态数据，使补全逻辑成为一个共享函数，
+// 两个前端（聊天 TUI 和桌面）都用自己的会话数据调用它。这保持了 CLI 和
+// 桌面子命令提示的一致性。
 type ArgData struct {
-	Skills          []skill.Skill
-	DisabledSkills  []skill.Skill
-	ServerNames     []string
-	ConfiguredMCP   []string
-	DisconnectedMCP []string
-	ModelRefs       []string
-	CurrentModel    string
-	ProviderNames   []string
-	CurrentProvider string
+	Skills          []skill.Skill // 已启用的技能列表
+	DisabledSkills  []skill.Skill // 已禁用的技能列表
+	ServerNames     []string      // 已连接的 MCP 服务器名称
+	ConfiguredMCP   []string      // 已配置的 MCP 服务器名称
+	DisconnectedMCP []string      // 已断开的 MCP 服务器名称
+	ModelRefs       []string      // 可用的模型引用列表
+	CurrentModel    string        // 当前使用的模型
+	ProviderNames   []string      // 可用的提供商名称列表
+	CurrentProvider string        // 当前使用的提供商
 }
 
 // SlashArgItems completes the arguments of a management slash command

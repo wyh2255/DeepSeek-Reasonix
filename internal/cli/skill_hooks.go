@@ -1,3 +1,7 @@
+// skill_hooks.go 实现了 TUI 中的 /skills 和 /hooks 子命令。
+// /skills 提供技能的列表、查看、启用/禁用、新建和路径查看功能，
+// 以及技能选择器的保存和会话刷新逻辑。
+// /hooks 提供钩子的列表和信任管理功能。
 package cli
 
 import (
@@ -13,6 +17,11 @@ import (
 	"reasonix/internal/skill"
 )
 
+// runSkillSubcommand 处理 "/skills" 命令及其子命令：
+// 无参数或 "manage"/"picker" 打开技能选择器；
+// "list"/"ls" 列出所有技能；"show"/"cat" 查看技能详情；
+// "enable"/"disable" 启用或禁用技能；"new"/"init" 创建新技能；
+// "paths" 显示技能搜索路径。
 func (m *chatTUI) runSkillSubcommand(input string) {
 	args := tokenizeArgs(input)
 	sub := ""
@@ -56,6 +65,7 @@ func (m *chatTUI) runSkillSubcommand(input string) {
 	}
 }
 
+// skillList 列出所有可用技能，以格式化文本提交到滚动区域。
 func (m *chatTUI) skillList() {
 	skills := m.skills
 	if m.ctrl != nil {
@@ -68,6 +78,7 @@ func (m *chatTUI) skillList() {
 	m.commitLine(renderSkillList(m.width, sortedSkills(skills), m.disabledSkillNames()))
 }
 
+// skillShow 查看指定名称的技能详情，包括描述、路径和正文预览。
 func (m *chatTUI) skillShow(name string) {
 	skills := m.skills
 	if m.ctrl != nil {
@@ -86,6 +97,7 @@ func (m *chatTUI) skillShow(name string) {
 	m.notice("unknown skill: " + name)
 }
 
+// disabledSkillNames 返回当前会话中已禁用的技能名称集合。
 func (m *chatTUI) disabledSkillNames() map[string]bool {
 	out := map[string]bool{}
 	if m.ctrl == nil {
@@ -97,10 +109,13 @@ func (m *chatTUI) disabledSkillNames() map[string]bool {
 	return out
 }
 
+// skillSetEnabled 设置指定技能的启用/禁用状态。
 func (m *chatTUI) skillSetEnabled(name string, enabled bool) {
 	m.skillSaveEnabledChanges(map[string]bool{name: enabled})
 }
 
+// skillSaveEnabledChanges 将技能启用/禁用变更持久化到用户配置文件，
+// 成功后安排会话刷新以使变更生效。
 func (m *chatTUI) skillSaveEnabledChanges(changes map[string]bool) {
 	if len(changes) == 0 {
 		return
@@ -155,6 +170,8 @@ func (m *chatTUI) skillSaveEnabledChanges(changes map[string]bool) {
 	m.scheduleSkillSessionRefresh("skill toggle", notice)
 }
 
+// scheduleSkillSessionRefresh 安排一次异步会话刷新，用于在技能变更后重建控制器。
+// 它保存当前快照、携带历史记录，通过 buildController 异步构建新控制器。
 func (m *chatTUI) scheduleSkillSessionRefresh(reason, notice string) bool {
 	if m.buildController == nil {
 		m.notice("skill refresh unavailable in this session")
@@ -197,6 +214,7 @@ func (m *chatTUI) scheduleSkillSessionRefresh(reason, notice string) bool {
 	return true
 }
 
+// enableVerb 根据启用状态返回 "enable" 或 "disable" 动词。
 func enableVerb(enabled bool) string {
 	if enabled {
 		return "enable"
@@ -204,6 +222,7 @@ func enableVerb(enabled bool) string {
 	return "disable"
 }
 
+// skillNew 在指定作用域（项目级或全局）创建新的技能文件。
 func (m *chatTUI) skillNew(name string, global bool) {
 	st := m.skillStore()
 	scope := skill.ScopeProject
@@ -218,11 +237,13 @@ func (m *chatTUI) skillNew(name string, global bool) {
 	m.notice(fmt.Sprintf("created skill %q at %s — edit it, then /new (or restart) to pick it up", name, path))
 }
 
+// skillPaths 显示所有技能搜索路径及其状态。
 func (m *chatTUI) skillPaths() {
 	st := m.skillStore()
 	m.commitLine(renderSkillPaths(m.width, st.Roots()))
 }
 
+// skillStore 创建并返回技能存储实例，加载配置中的自定义路径、排除路径和最大深度。
 func (m *chatTUI) skillStore() *skill.Store {
 	cwd, _ := os.Getwd()
 	var custom []string
@@ -236,6 +257,8 @@ func (m *chatTUI) skillStore() *skill.Store {
 	return skill.New(skill.Options{ProjectRoot: cwd, CustomPaths: custom, ExcludedPaths: excluded, MaxDepth: maxDepth})
 }
 
+// runHooksSubcommand 处理 "/hooks" 命令及其子命令：
+// 无参数或 "list"/"ls" 列出钩子；"trust" 信任当前项目的钩子。
 func (m *chatTUI) runHooksSubcommand(input string) {
 	args := tokenizeArgs(input)
 	sub := ""
@@ -257,12 +280,14 @@ func (m *chatTUI) runHooksSubcommand(input string) {
 	}
 }
 
+// hooksList 列出当前项目的活跃钩子和信任状态。
 func (m *chatTUI) hooksList(cwd string) {
 	active := m.ctrl.HookRunner().Hooks()
 	trusted := hook.IsTrusted(cwd, "")
 	m.commitLine(renderHooks(m.width, active, trusted, hook.ProjectDefinesHooks(cwd)))
 }
 
+// containsArg 检查参数列表中是否包含指定的标志字符串。
 func containsArg(args []string, flag string) bool {
 	for _, a := range args {
 		if a == flag {

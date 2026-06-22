@@ -1,3 +1,6 @@
+// resume_picker.go 实现了 TUI 中 /resume 命令的交互式会话选择器覆盖层。
+// 用户可通过 ↑/↓ 键浏览保存的会话列表，按 Enter 确认恢复，
+// 按 Esc 取消。其模式与 rewindPicker 类似。
 package cli
 
 import (
@@ -11,18 +14,17 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// resumePicker is an in-chat overlay for "/resume" that lets the user pick a
-// saved session by navigating with ↑/↓ and confirming with Enter. It mirrors
-// the rewindPicker pattern: keys route through handleResumePickerKey and it
-// renders via renderResumePicker while m.resumePick is set.
+// resumePicker 是 /resume 命令的交互式覆盖层，允许用户通过 ↑/↓ 导航浏览
+// 已保存的会话，按 Enter 确认恢复。按键通过 handleResumePickerKey 路由，
+// 渲染通过 renderResumePicker 完成，当 m.resumePick 非 nil 时激活。
 type resumePicker struct {
 	sessions []agent.SessionInfo
 	sel      int // selected index
 	active   int // index of the currently-active session (-1 when none)
 }
 
-// openResumePicker populates the picker from the session directory and opens it.
-// A no-op (with a notice) when there are no saved sessions.
+// openResumePicker 从会话目录加载数据并打开会话选择器。
+// 当没有已保存的会话时，显示通知并返回（不打开选择器）。
 func (m *chatTUI) openResumePicker() {
 	sessions := recentSessions(m.ctrl.SessionDir())
 	if len(sessions) == 0 {
@@ -45,6 +47,8 @@ func (m *chatTUI) openResumePicker() {
 	m.resumePick = &resumePicker{sessions: sessions, sel: sel, active: activeIdx}
 }
 
+// handleResumePickerKey 处理会话选择器中的按键事件：
+// ↑/k 向上导航、↓/j 向下导航、Enter 确认选择、Esc 关闭选择器。
 func (m chatTUI) handleResumePickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	r := m.resumePick
 	if r == nil {
@@ -67,6 +71,8 @@ func (m chatTUI) handleResumePickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 	return m, nil
 }
 
+// applyResumePick 执行会话选择器的确认操作：加载选中的会话，
+// 保存当前会话快照，恢复目标会话并回放其对话记录。
 func (m chatTUI) applyResumePick() (tea.Model, tea.Cmd) {
 	r := m.resumePick
 	if r == nil || r.sel < 0 || r.sel >= len(r.sessions) {
@@ -93,6 +99,8 @@ func (m chatTUI) applyResumePick() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// renderResumePicker 渲染会话选择器的界面，包括标题、会话列表（带选中高亮）
+// 和操作提示，使用 choicePanelStyle 样式化输出。
 func (m chatTUI) renderResumePicker() string {
 	r := m.resumePick
 	if r == nil {
@@ -112,8 +120,8 @@ func (m chatTUI) renderResumePicker() string {
 	return choicePanelStyle.Width(w).Render(b.String())
 }
 
-// sessionPickerLabel is the "N turns · topicTitle/first message" line, truncated to fit.
-// When a TopicTitle is set (via /rename or desktop), it is shown instead of the raw preview.
+// sessionPickerLabel 生成会话选择器中每行的标签文本（"N turns · topicTitle/first message"），
+// 截断以适应显示宽度。当设置了 TopicTitle 时优先显示标题而非原始预览。
 func sessionPickerLabel(s agent.SessionInfo) string {
 	preview := s.Preview
 	if s.TopicTitle != "" {

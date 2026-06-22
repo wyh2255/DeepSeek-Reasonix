@@ -1,3 +1,6 @@
+// select.go 实现了终端中的交互式单选和多选菜单组件。
+// 支持键盘导航（↑/↓/j/k）、搜索过滤（/）、滚动视口，
+// 适用于 TTY 环境下的 setup 流程和 CLI 工具选择。
 package cli
 
 import (
@@ -11,15 +14,16 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// errCancelled is returned by selectOne when the user aborts (q or Ctrl-C).
+// errCancelled 当用户中止选择（按 q 或 Ctrl-C）时由 selectOne/selectMany 返回。
 var errCancelled = errors.New("selection cancelled")
 
+// menuItem 表示菜单中的一个选项，包含名称和描述。
 type menuItem struct {
 	name string
 	desc string
 }
 
-// termHeight returns the terminal's row count, falling back to 24 on error.
+// termHeight 返回终端的行数，出错时回退到 24。
 func termHeight(fd int) int {
 	_, h, err := term.GetSize(fd)
 	if err != nil || h <= 0 {
@@ -28,9 +32,8 @@ func termHeight(fd int) int {
 	return h
 }
 
-// fixedLines returns the number of non-item lines rendered each frame:
-// header label, blank separator, scroll-up indicator, scroll-down indicator.
-// When searching is true the search bar adds one more line.
+// fixedLines 返回每帧渲染的非菜单项行数：标题标签、空白分隔符、
+// 向上滚动指示器、向下滚动指示器。搜索模式下额外增加一行搜索栏。
 func fixedLines(searching bool) int {
 	n := 4 // header + blank + scroll-up + scroll-down
 	if searching {
@@ -39,8 +42,8 @@ func fixedLines(searching bool) int {
 	return n
 }
 
-// maxViewport calculates how many menu item rows fit after subtracting the
-// fixed lines from the available terminal rows, leaving at least 1 row.
+// maxViewport 计算从可用终端行数中减去固定行数后能容纳的菜单项行数，
+// 至少保留 1 行。
 func maxViewport(totalItems, termRows int, searching bool) int {
 	avail := termRows - fixedLines(searching)
 	if avail < 1 {
@@ -52,12 +55,12 @@ func maxViewport(totalItems, termRows int, searching bool) int {
 	return avail
 }
 
-// renderSearchBar draws the search input line when searching is active.
+// renderSearchBar 在搜索模式激活时绘制搜索输入行。
 func renderSearchBar(w *os.File, query string) {
 	fmt.Fprintf(w, "\r\033[K%s %s\n", accent("🔍"), query+"_")
 }
 
-// filterMenuItems returns items whose name or desc contain the query (case-insensitive).
+// filterMenuItems 返回名称或描述中包含查询字符串（不区分大小写）的菜单项。
 func filterMenuItems(items []menuItem, query string) []menuItem {
 	if query == "" {
 		return items
@@ -72,12 +75,10 @@ func filterMenuItems(items []menuItem, query string) []menuItem {
 	return out
 }
 
-// selectOne renders an interactive single-choice menu navigated with the arrow
-// keys (or j/k), confirmed with Enter, aborted with q or Ctrl-C. It puts the
-// terminal in raw mode, so it requires a TTY (callers gate on isInteractive).
-// When the item list exceeds the terminal height, only a viewport-sized window
-// is shown, with scroll indicators. Pressing '/' enters search mode to filter
-// items by keyword.
+// selectOne 渲染一个交互式单选菜单，使用方向键（或 j/k）导航，
+// 按 Enter 确认，按 q 或 Ctrl-C 中止。它将终端置于 raw 模式，
+// 因此需要 TTY 环境。当菜单项超过终端高度时，只显示视口大小的窗口，
+// 并带有滚动指示器。按 '/' 进入搜索模式按关键词过滤选项。
 func selectOne(label string, items []menuItem) (int, error) {
 	fd := int(os.Stdin.Fd())
 	old, err := term.MakeRaw(fd)
@@ -259,11 +260,10 @@ func selectOne(label string, items []menuItem) (int, error) {
 	}
 }
 
-// selectMany renders an interactive multi-choice menu: arrow keys (or j/k) move,
-// Space toggles, Enter confirms (at least one required), q/Ctrl-C aborts. It
-// returns the checked indices in order and requires a TTY. When the item list
-// exceeds the terminal height, only a viewport-sized window is shown. Pressing
-// '/' enters search mode to filter items by keyword.
+// selectMany 渲染一个交互式多选菜单：方向键（或 j/k）移动，空格切换选中状态，
+// 按 Enter 确认（至少需要选择一项），按 q 或 Ctrl-C 中止。
+// 返回选中的索引列表（按顺序），需要 TTY 环境。
+// 当菜单项超过终端高度时只显示视口大小的窗口。按 '/' 进入搜索模式。
 func selectMany(label string, items []menuItem) ([]int, error) {
 	fd := int(os.Stdin.Fd())
 	old, err := term.MakeRaw(fd)
@@ -486,7 +486,7 @@ func selectMany(label string, items []menuItem) ([]int, error) {
 	}
 }
 
-// filterIndices returns the original indices of items matching query.
+// filterIndices 返回匹配查询字符串的菜单项在原始列表中的索引。
 func filterIndices(items []menuItem, query string) []int {
 	if query == "" {
 		out := make([]int, len(items))
@@ -505,8 +505,7 @@ func filterIndices(items []menuItem, query string) []int {
 	return out
 }
 
-// FrameLines is exported for testing. It returns the total number of terminal
-// lines that selectOne/selectMany will print for the given state.
+// FrameLines 为测试而导出，返回在给定状态下 selectOne/selectMany 将打印的终端总行数。
 func FrameLines(filteredLen, termRows int, searching bool) int {
 	return fixedLines(searching) + maxViewport(filteredLen, termRows, searching)
 }

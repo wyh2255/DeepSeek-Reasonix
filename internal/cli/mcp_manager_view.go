@@ -1,6 +1,11 @@
+// mcp_manager_view.go 负责渲染 /mcp 管理器的所有视觉界面。
+// 该文件包含：
+//   - 服务器列表视图（分组显示用户 MCP 和托管 MCP）
+//   - 服务器详情视图（状态、认证、传输类型、能力、命令等）
+//   - 工具列表视图和日志查看视图
+//   - 确认删除和确认清除认证的对话框
+//   - 状态标签、认证标签和操作列表的渲染辅助函数
 package cli
-
-// mcp_manager_view.go renders the /mcp manager overlay and its display strings.
 
 import (
 	"fmt"
@@ -9,6 +14,7 @@ import (
 	"reasonix/internal/mcpdiag"
 )
 
+// renderMCPManager 渲染 MCP 管理器的覆盖层界面。
 func (m chatTUI) renderMCPManager() string {
 	if m.mcp == nil {
 		return ""
@@ -16,6 +22,7 @@ func (m chatTUI) renderMCPManager() string {
 	return m.mcp.render(m.width)
 }
 
+// render 根据当前阶段渲染对应的管理器页面内容。
 func (p *mcpManager) render(width int) string {
 	w := max(viewWidth(width), 40)
 	switch p.stage {
@@ -34,6 +41,7 @@ func (p *mcpManager) render(width int) string {
 	}
 }
 
+// footerHint 返回当前页面底部的操作提示文本。
 func (p *mcpManager) footerHint() string {
 	switch p.stage {
 	case mcpStageDetail:
@@ -50,6 +58,8 @@ func (p *mcpManager) footerHint() string {
 	}
 }
 
+// renderList 渲染 MCP 服务器列表页面。
+// 按"托管 MCP"和"用户 MCP"分组显示，支持分页和滚动提示。
 func (p *mcpManager) renderList(width int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", viewHeader("Manage MCP servers"))
@@ -91,6 +101,7 @@ func (p *mcpManager) renderList(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderListRow 渲染列表中的单行服务器信息，包含名称、状态、工具数量等元数据。
 func (p *mcpManager) renderListRow(i int, s mcpServerView, width int) string {
 	prefix := "    "
 	if i == p.sel {
@@ -118,6 +129,7 @@ func (p *mcpManager) renderListRow(i int, s mcpServerView, width int) string {
 	return fmt.Sprintf("%s%s · %s", prefix, name, viewMeta(meta))
 }
 
+// renderDetail 渲染服务器详情页面，显示完整的服务器信息和可执行操作列表。
 func (p *mcpManager) renderDetail(width int) string {
 	v, ok := p.selectedServer()
 	if !ok {
@@ -165,6 +177,7 @@ func (p *mcpManager) renderDetail(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderTools 渲染服务器的工具列表页面。
 func (p *mcpManager) renderTools(width int) string {
 	v, ok := p.selectedServer()
 	if !ok {
@@ -190,6 +203,7 @@ func (p *mcpManager) renderTools(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderLogs 渲染服务器的错误日志页面。
 func (p *mcpManager) renderLogs(width int) string {
 	v, ok := p.selectedServer()
 	if !ok {
@@ -205,6 +219,7 @@ func (p *mcpManager) renderLogs(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderConfirmRemove 渲染确认删除服务器的对话框。
 func (p *mcpManager) renderConfirmRemove(width int) string {
 	v, ok := p.selectedServer()
 	if !ok {
@@ -218,6 +233,7 @@ func (p *mcpManager) renderConfirmRemove(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderConfirmClearAuth 渲染确认清除认证信息的对话框。
 func (p *mcpManager) renderConfirmClearAuth(width int) string {
 	v, ok := p.selectedServer()
 	if !ok {
@@ -232,6 +248,11 @@ func (p *mcpManager) renderConfirmClearAuth(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// mcpActionsFor 根据服务器状态和配置信息生成可用的操作列表。
+// 不同状态的服务器有不同的操作选项：
+// - 失败状态：重试/认证/查看日志/编辑配置
+// - 已连接：重连/编辑配置/禁用/移除
+// - 禁用：启用并连接
 func mcpActionsFor(v mcpServerView, configPath string) []mcpActionItem {
 	var out []mcpActionItem
 	if v.Tools > 0 || len(v.ToolList) > 0 {
@@ -270,6 +291,7 @@ func mcpActionsFor(v mcpServerView, configPath string) []mcpActionItem {
 	return out
 }
 
+// appendMCPFailureSecondaryActions 为失败状态的服务器追加次要操作项。
 func appendMCPFailureSecondaryActions(out []mcpActionItem, v mcpServerView, configPath string) []mcpActionItem {
 	if strings.TrimSpace(v.Error) != "" {
 		out = append(out, mcpActionItem{mcpActionLogs, "View logs"})
@@ -284,6 +306,7 @@ func appendMCPFailureSecondaryActions(out []mcpActionItem, v mcpServerView, conf
 	return out
 }
 
+// appendMCPConfigActions 为已配置的非内置服务器追加"编辑配置"操作项。
 func appendMCPConfigActions(out []mcpActionItem, v mcpServerView, configPath string) []mcpActionItem {
 	if v.Configured {
 		if !v.BuiltIn && configPath != "" {
@@ -293,6 +316,7 @@ func appendMCPConfigActions(out []mcpActionItem, v mcpServerView, configPath str
 	return out
 }
 
+// writeMCPDetailField 将详情页的一个字段写入构建器，空值时跳过。
 func writeMCPDetailField(b *strings.Builder, label, value string) {
 	if strings.TrimSpace(value) == "" {
 		return
@@ -300,6 +324,7 @@ func writeMCPDetailField(b *strings.Builder, label, value string) {
 	fmt.Fprintf(b, "%-16s %s\n", label+":", value)
 }
 
+// mcpStatusLabel 返回服务器状态的彩色标签文本（如 "✓ connected"、"✕ failed"）。
 func mcpStatusLabel(v mcpServerView) string {
 	switch {
 	case v.Status == "connected":
@@ -319,6 +344,7 @@ func mcpStatusLabel(v mcpServerView) string {
 	}
 }
 
+// mcpAuthLabel 返回服务器认证状态的彩色标签文本。
 func mcpAuthLabel(v mcpServerView) string {
 	switch {
 	case v.Status == "connected":
@@ -332,6 +358,7 @@ func mcpAuthLabel(v mcpServerView) string {
 	}
 }
 
+// mcpCapabilitiesText 返回服务器能力的文本描述（如 "tools, prompts, resources"）。
 func mcpCapabilitiesText(v mcpServerView) string {
 	var caps []string
 	if v.Tools > 0 {
@@ -349,6 +376,7 @@ func mcpCapabilitiesText(v mcpServerView) string {
 	return strings.Join(caps, ", ")
 }
 
+// mcpCommandLabel 根据传输类型返回命令/URL 字段的标签名。
 func mcpCommandLabel(v mcpServerView) string {
 	if v.Transport == "http" || v.Transport == "sse" {
 		return "URL"
@@ -356,6 +384,7 @@ func mcpCommandLabel(v mcpServerView) string {
 	return "Command"
 }
 
+// mcpCommandLine 返回服务器的命令行或 URL 显示文本。
 func mcpCommandLine(v mcpServerView) string {
 	if v.Transport == "http" || v.Transport == "sse" {
 		return strings.TrimSpace(v.URL)

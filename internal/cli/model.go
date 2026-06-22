@@ -1,3 +1,6 @@
+// model.go 实现了 TUI 中的 /model 子命令，用于列出已配置的模型引用、
+// 在当前会话中切换模型，以及将用户选择持久化到配置文件。
+// 同时提供了模型引用和 Provider 名称的自动补全数据源。
 package cli
 
 import (
@@ -9,10 +12,9 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// runModelSubcommand handles "/model": with no argument it lists the configured
-// (provider, model) refs and marks the active one; "/model <ref>" switches the
-// session to that model in place, carrying the conversation across. The actual
-// controller build runs asynchronously so it cannot block the TUI event loop.
+// runModelSubcommand 处理 "/model" 命令：无参数时列出所有已配置的 (provider, model) 引用
+// 并标记当前活跃模型；"/model <ref>" 将当前会话切换到指定模型，同时保留对话历史。
+// 控制器的实际构建是异步进行的，不会阻塞 TUI 事件循环。
 func (m *chatTUI) runModelSubcommand(input string) {
 	args := tokenizeArgs(input) // args[0] == "/model"
 	if len(args) < 2 {
@@ -78,7 +80,7 @@ func (m *chatTUI) runModelSubcommand(input string) {
 	}
 }
 
-// showModels lists the configured provider/model refs, marking the active one.
+// showModels 列出所有已配置的 provider/model 引用，并标记当前活跃的模型。
 func (m *chatTUI) showModels() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -98,14 +100,11 @@ func (m *chatTUI) showModels() {
 	m.commitLine(renderModels(m.width, refs, m.modelRef))
 }
 
-// persistModel writes ref (a "provider/model" string) to default_model in the
-// user config.toml so the next CLI launch starts on the same
-// model. The in-memory switch is always allowed to proceed regardless of the
-// outcome here, but every step (rejected by validation, save failed, or
-// persisted successfully) reports back to the TUI notice channel so the user
-// can see whether their /model choice will survive a restart. Run before
-// Snapshot/ModelSwitchingFmt so the persistence outcome shows up first in
-// the notice area.
+// persistModel 将 ref（格式为 "provider/model" 字符串）写入用户配置文件的 default_model 字段，
+// 使下次 CLI 启动时能从同一模型开始。内存中的切换不受持久化结果影响，
+// 但每个步骤（验证拒绝、保存失败或持久化成功）都会通过 TUI 通知通道报告，
+// 让用户知道他们的 /model 选择是否能在重启后保留。
+// 在 Snapshot/ModelSwitchingFmt 之前运行，以便持久化结果首先显示在通知区域。
 func (m *chatTUI) persistModel(ref string) {
 	path := config.UserConfigPath()
 	if path == "" {
@@ -123,7 +122,7 @@ func (m *chatTUI) persistModel(ref string) {
 	m.notice(fmt.Sprintf("model: persisted (ref=%s, path=%s)", ref, path))
 }
 
-// modelRefs returns the configured provider/model refs for slash completion.
+// modelRefs 返回所有已配置的 provider/model 引用列表，用于斜杠命令自动补全。
 func modelRefs() []string {
 	cfg, err := config.Load()
 	if err != nil {
@@ -142,7 +141,7 @@ func modelRefs() []string {
 	return out
 }
 
-// providerNames returns the names of configured providers for slash completion.
+// providerNames 返回已配置的 Provider 名称列表，用于斜杠命令自动补全。
 func providerNames() []string {
 	cfg, err := config.Load()
 	if err != nil {

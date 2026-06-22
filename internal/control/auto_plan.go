@@ -1,3 +1,8 @@
+// 文件：auto_plan.go
+//
+// 自动计划模式——判断用户输入是否需要先进行只读计划。
+// 当用户提交复杂任务时，自动进入计划模式，让模型先研究代码库并提出分层计划，
+// 用户批准后再执行。本文件包含启发式评分、LLM 分类器集成和计划模式门控逻辑。
 package control
 
 import (
@@ -18,7 +23,11 @@ const (
 
 var numberedListRE = regexp.MustCompile(`(?m)^\s*(?:[-*]|\d+[.)])\s+\S`)
 
+// AutoPlanClassifier 是自动计划分类器的接口。当启发式评分不够确定时，
+// 通过 LLM 调用来判断用户输入是否需要进入计划模式。
 type AutoPlanClassifier interface {
+	// NeedsPlan 判断给定输入是否需要计划模式。输入包括用户文本和启发式评分。
+	// 返回 (是否需要计划, 原因说明, 错误)。
 	NeedsPlan(ctx context.Context, input string, score int) (bool, string, error)
 }
 
@@ -35,6 +44,9 @@ func normalizeAutoPlan(mode string) string {
 	}
 }
 
+// maybeAutoPlan 在每个轮次开始时检查是否应自动进入计划模式。
+// 如果启发式评分和可选的 LLM 分类器都认为输入是多步骤任务，
+// 则自动开启计划模式，让模型先研究代码库并提出计划。
 func (c *Controller) maybeAutoPlan(ctx context.Context, input string) {
 	if c.shouldAutoPlan(ctx, input) {
 		c.SetPlanMode(true)

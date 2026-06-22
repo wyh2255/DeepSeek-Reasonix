@@ -1,3 +1,13 @@
+// 文件：refs.go
+//
+// @ 引用解析——将用户输入中的 @ 引用解析为文件内容、目录列表或 MCP 资源。
+// 支持三种引用类型：
+//   - refResource: MCP 资源引用（@server:uri）
+//   - refFile: 本地文件或目录引用（@path）
+//   - refImage: 本地图片附件引用（@.reasonix/attachments/file）
+//
+// 解析过程包括：令牌提取、引用分类、裸名称批量解析、沙箱化文件读取、
+// PDF 文本提取等。所有文件读取都限定在工作区根目录内（通过 os.Root）。
 package control
 
 import (
@@ -17,12 +27,14 @@ import (
 	"reasonix/internal/proc"
 )
 
-// maxFileRefBytes caps how much of an @-referenced file is injected into a
-// message, so "@somehuge.log" can't blow the context window. The head is kept
-// and the rest noted as truncated.
+// maxFileRefBytes 限制 @ 引用文件注入到消息中的最大字节数，
+// 防止 "@somehuge.log" 填爆上下文窗口。保留头部，其余标记为截断。
 const maxFileRefBytes = 64 * 1024
 
+// pdfExtractTimeout 是 PDF 文本提取的最大等待时间。
 const pdfExtractTimeout = 8 * time.Second
+
+// pdfExtractWaitDelay 是 PDF 提取命令取消后等待管道排空的时间。
 const pdfExtractWaitDelay = 1 * time.Second
 
 var extractPDFText = extractPDFTextDefault

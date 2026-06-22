@@ -1,3 +1,7 @@
+// theme.go 实现了 CLI 的主题系统。
+// 负责管理深色/浅色主题的配色方案、主题样式变体（如 graphite、aurora 等）、
+// 终端背景色自动检测（OSC 11 协议与 COLORFGBG 环境变量回退）、
+// 以及所有 UI 组件（输入框、滚动条、状态栏等）的样式刷新。
 package cli
 
 import (
@@ -15,11 +19,14 @@ import (
 	"reasonix/internal/i18n"
 )
 
+// cliColor 表示一个颜色值，同时保存十六进制字符串和 xterm 256 色编号，
+// 以便在支持真彩色的终端使用 hex，在不支持时回退到 xterm。
 type cliColor struct {
 	hex   string
 	xterm int
 }
 
+// cliPalette 是一个完整的主题配色方案，包含所有 UI 元素所需的颜色定义。
 type cliPalette struct {
 	name         string
 	style        string
@@ -39,6 +46,8 @@ type cliPalette struct {
 	toolProc     cliColor
 }
 
+// cliThemeStyle 定义一个主题样式变体（如 graphite、aurora），包含样式名称、
+// 所属的明暗模式、强调色和描述信息。
 type cliThemeStyle struct {
 	name        string
 	mode        string
@@ -46,6 +55,7 @@ type cliThemeStyle struct {
 	description string
 }
 
+// 预定义的深色和浅色基础主题，以及所有可用的样式变体列表。
 var (
 	cliDarkTheme = cliPalette{
 		name:         "dark",
@@ -97,10 +107,13 @@ var (
 	queryTerminalBackgroundForTheme = queryTerminalBackground
 )
 
+// configureCLITheme 根据给定的明暗模式（"dark"/"light"/"auto"）配置 CLI 主题。
 func configureCLITheme(mode string) {
 	configureCLIThemeWithStyle(mode, "")
 }
 
+// configureCLIThemeWithStyle 根据明暗模式和样式名称配置 CLI 主题。
+// 优先读取 REASONIX_THEME 和 REASONIX_THEME_STYLE 环境变量覆盖参数值。
 func configureCLIThemeWithStyle(mode, style string) {
 	if env := strings.TrimSpace(os.Getenv("REASONIX_THEME")); env != "" {
 		if st, ok := cliThemeStyleByName(env); ok {
@@ -117,10 +130,14 @@ func configureCLIThemeWithStyle(mode, style string) {
 	refreshCLIStyles()
 }
 
+// resolveCLITheme 根据明暗模式解析并返回最终的主题配色方案。
 func resolveCLITheme(mode string) cliPalette {
 	return resolveCLIThemeWithStyle(mode, "")
 }
 
+// resolveCLIThemeWithStyle 根据明暗模式和样式名称解析主题。
+// 如果 mode 本身是一个样式名（如 "aurora"），则直接使用该样式；
+// 否则根据 mode 确定明暗模式，再查找匹配的样式。
 func resolveCLIThemeWithStyle(mode, style string) cliPalette {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if st, ok := cliThemeStyleByName(mode); ok {
@@ -134,6 +151,9 @@ func resolveCLIThemeWithStyle(mode, style string) cliPalette {
 	return buildCLITheme(resolvedMode, st.name)
 }
 
+// resolveCLIThemeMode 将用户指定的模式字符串解析为 "dark" 或 "light"。
+// 当模式为 "auto" 或空时，依次尝试：OSC 11 终端背景色检测、COLORFGBG 环境变量，
+// 最终回退到 "dark"。
 func resolveCLIThemeMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "light":
@@ -156,6 +176,8 @@ func resolveCLIThemeMode(mode string) string {
 	}
 }
 
+// buildCLITheme 根据明暗模式和样式名称构建最终的 cliPalette。
+// 先选择深色或浅色基础主题，再应用样式变体的强调色。
 func buildCLITheme(mode, style string) cliPalette {
 	base := cliDarkTheme
 	if mode == "light" {
@@ -168,6 +190,7 @@ func buildCLITheme(mode, style string) cliPalette {
 	return applyCLIThemeStyle(base, st)
 }
 
+// applyCLIThemeStyle 将样式变体的强调色应用到基础主题上，返回修改后的新主题。
 func applyCLIThemeStyle(base cliPalette, style cliThemeStyle) cliPalette {
 	base.style = style.name
 	base.accent = style.accent
@@ -175,6 +198,7 @@ func applyCLIThemeStyle(base cliPalette, style cliThemeStyle) cliPalette {
 	return base
 }
 
+// cliThemeStyleByName 根据名称查找预定义的样式变体，返回样式和是否找到。
 func cliThemeStyleByName(name string) (cliThemeStyle, bool) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	for _, st := range cliThemeStyles {
@@ -185,6 +209,7 @@ func cliThemeStyleByName(name string) (cliThemeStyle, bool) {
 	return cliThemeStyle{}, false
 }
 
+// defaultCLIThemeStyle 返回指定明暗模式下的默认样式：浅色模式默认 "sandstone"，深色默认 "graphite"。
 func defaultCLIThemeStyle(mode string) cliThemeStyle {
 	if mode == "light" {
 		for _, st := range cliThemeStyles {
@@ -207,6 +232,8 @@ func withoutTerminalProbe(fn func()) {
 	fn()
 }
 
+// setCLIThemeMode 在运行时切换主题的明暗模式，用于 TUI 内部的 /theme 命令。
+// 由于此时 TUI 拥有 stdin，禁用终端背景探测以避免输入冲突。
 func setCLIThemeMode(mode string) cliPalette {
 	// A runtime /theme switch runs inside the TUI, which owns stdin, so resolving
 	// "auto" must not live-probe the terminal here.
@@ -217,6 +244,7 @@ func setCLIThemeMode(mode string) cliPalette {
 	return activeCLITheme
 }
 
+// setCLIThemeStyle 在运行时切换主题的样式变体，返回新主题和是否成功。
 func setCLIThemeStyle(name string) (cliPalette, bool) {
 	st, ok := cliThemeStyleByName(name)
 	if !ok {
@@ -227,17 +255,22 @@ func setCLIThemeStyle(name string) (cliPalette, bool) {
 	return activeCLITheme, true
 }
 
+// terminalRGB 表示从终端查询到的背景色 RGB 值。
 type terminalRGB struct {
 	r int
 	g int
 	b int
 }
 
+// looksLight 根据感知亮度公式（ITU-R BT.709）判断背景色是否偏亮。
+// 亮度阈值为 150（满分 255）。
 func (c terminalRGB) looksLight() bool {
 	luma := 0.2126*float64(c.r) + 0.7152*float64(c.g) + 0.0722*float64(c.b)
 	return luma >= 150
 }
 
+// parseOSC11Response 解析 OSC 11 终端响应字符串，提取背景色 RGB 值。
+// 支持 "#RRGGBB"、"rgb:RR/GG/BB" 和 "rgba:RR/GG/BB/AA" 三种格式。
 func parseOSC11Response(s string) (terminalRGB, bool) {
 	idx := strings.Index(s, "]11;")
 	if idx < 0 {
@@ -262,6 +295,8 @@ func parseOSC11Response(s string) (terminalRGB, bool) {
 	return terminalRGB{}, false
 }
 
+// parseOSCColorTriplet 解析 "RR/RRRR/GGGG" 格式的 OSC 颜色三元组，
+// 每个分量可以是 1-4 个十六进制字符，自动归一化到 0-255 范围。
 func parseOSCColorTriplet(s string) (terminalRGB, bool) {
 	parts := strings.Split(s, "/")
 	if len(parts) < 3 {
@@ -273,6 +308,7 @@ func parseOSCColorTriplet(s string) (terminalRGB, bool) {
 	return terminalRGB{r, g, b}, okR && okG && okB
 }
 
+// parseOSCColorComponent 将单个十六进制颜色分量归一化为 0-255 的整数值。
 func parseOSCColorComponent(s string) (int, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" || len(s) > 4 {
@@ -289,6 +325,9 @@ func parseOSCColorComponent(s string) (int, bool) {
 	return int(v * 255 / max), true
 }
 
+// colorFGBGLooksLight 通过 COLORFGBG 环境变量判断终端背景是否偏亮。
+// 该变量格式为 "fg;bg"，bg 为 7 或 15 时表示浅色背景。
+// 这是 OSC 11 检测不可用时的回退方案。
 func colorFGBGLooksLight() bool {
 	parts := strings.Split(os.Getenv("COLORFGBG"), ";")
 	if len(parts) == 0 {
@@ -298,6 +337,8 @@ func colorFGBGLooksLight() bool {
 	return err == nil && (bg == 7 || bg == 15)
 }
 
+// fgSGR 生成设置前景色的 ANSI SGR 转义序列。
+// 优先使用真彩色（24-bit RGB），不支持时回退到 xterm 256 色。
 func fgSGR(c cliColor) string {
 	if supportsTrueColor() && c.hex != "" {
 		r, g, b, ok := parseHexColor(c.hex)
@@ -308,6 +349,7 @@ func fgSGR(c cliColor) string {
 	return fmt.Sprintf("\033[38;5;%dm", c.xterm)
 }
 
+// bgSGR 生成设置背景色的 ANSI SGR 转义序列。逻辑同 fgSGR。
 func bgSGR(c cliColor) string {
 	if supportsTrueColor() && c.hex != "" {
 		r, g, b, ok := parseHexColor(c.hex)
@@ -318,6 +360,7 @@ func bgSGR(c cliColor) string {
 	return fmt.Sprintf("\033[48;5;%dm", c.xterm)
 }
 
+// parseHexColor 将 "#RRGGBB" 格式的十六进制颜色字符串解析为 R、G、B 整数值。
 func parseHexColor(hex string) (int, int, int, bool) {
 	hex = strings.TrimPrefix(hex, "#")
 	if len(hex) != 6 {
@@ -329,6 +372,8 @@ func parseHexColor(hex string) (int, int, int, bool) {
 	return int(r), int(g), int(b), errR == nil && errG == nil && errB == nil
 }
 
+// supportsTrueColor 检测当前终端是否支持真彩色（24-bit）输出。
+// 通过 COLORTERM 环境变量和 TERM_PROGRAM 已知支持的终端来判断。
 func supportsTrueColor() bool {
 	ct := strings.ToLower(os.Getenv("COLORTERM"))
 	if strings.Contains(ct, "truecolor") || strings.Contains(ct, "24bit") {
@@ -342,10 +387,13 @@ func supportsTrueColor() bool {
 	}
 }
 
+// themeFg 用指定颜色为文本添加前景色 SGR 转义序列。
 func themeFg(c cliColor, s string) string {
 	return sgr(fgSGR(c), s)
 }
 
+// themeLipColor 将 cliColor 转换为 lipgloss 可用的 color.Color 接口，
+// 优先使用真彩色 hex 值，不支持时回退到 xterm 色号。
 func themeLipColor(c cliColor) color.Color {
 	if supportsTrueColor() && c.hex != "" {
 		return lipgloss.Color(c.hex)
@@ -353,6 +401,7 @@ func themeLipColor(c cliColor) color.Color {
 	return lipgloss.Color(strconv.Itoa(c.xterm))
 }
 
+// themeStyle 创建一个带有指定前景色的 lipgloss 样式。颜色禁用时返回空样式。
 func themeStyle(c cliColor) lipgloss.Style {
 	if !colorEnabled {
 		return lipgloss.NewStyle()
@@ -360,6 +409,7 @@ func themeStyle(c cliColor) lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(themeLipColor(c))
 }
 
+// withThemeFG 在已有样式上叠加前景色。颜色禁用时返回原样式。
 func withThemeFG(st lipgloss.Style, c cliColor) lipgloss.Style {
 	if !colorEnabled {
 		return st
@@ -367,6 +417,7 @@ func withThemeFG(st lipgloss.Style, c cliColor) lipgloss.Style {
 	return st.Foreground(themeLipColor(c))
 }
 
+// withThemeBorderFG 在已有样式上叠加边框前景色。颜色禁用时返回原样式。
 func withThemeBorderFG(st lipgloss.Style, c cliColor) lipgloss.Style {
 	if !colorEnabled {
 		return st
@@ -378,6 +429,8 @@ func init() {
 	refreshCLIStyles()
 }
 
+// refreshCLIStyles 根据当前活跃主题刷新所有全局 UI 组件样式，
+// 包括输入框、审批横幅、待办面板、状态栏、选择高亮、滚动条等。
 func refreshCLIStyles() {
 	inputBoxStyle = withThemeBorderFG(lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder(), true, false, true, false), activeCLITheme.accent).
@@ -399,6 +452,8 @@ func refreshCLIStyles() {
 	scrollTrackStyle = themeStyle(activeCLITheme.faint)
 }
 
+// applyTextareaTheme 将当前主题应用到文本输入框组件，设置焦点/失焦状态下的
+// 各行样式（行号、占位符、光标等）。
 func applyTextareaTheme(ti *textarea.Model) {
 	plain := lipgloss.NewStyle()
 	weak := themeStyle(activeCLITheme.faint)
@@ -435,6 +490,8 @@ func applyTextareaTheme(ti *textarea.Model) {
 	ti.SetStyles(styles)
 }
 
+// runThemeSubcommand 处理用户输入的 /theme 命令，解析参数并切换主题。
+// 支持 "/theme auto"、"/theme light"、"/theme dark" 和样式名（如 "/theme aurora"）。
 func (m *chatTUI) runThemeSubcommand(input string) {
 	args := tokenizeArgs(input)
 	if len(args) < 2 {
@@ -461,6 +518,7 @@ func (m *chatTUI) runThemeSubcommand(input string) {
 	m.persistTheme(name)
 }
 
+// persistTheme 将当前主题选择持久化到用户配置文件，使重启后仍保持用户选择。
 func (m *chatTUI) persistTheme(inputName string) {
 	path := config.UserConfigPath()
 	if path == "" {
@@ -480,11 +538,14 @@ func (m *chatTUI) persistTheme(inputName string) {
 	}
 }
 
+// refreshRuntimeTheme 在运行时刷新 TUI 组件的主题样式（加载动画、输入框等）。
 func (m *chatTUI) refreshRuntimeTheme() {
 	m.spinner.Style = themeStyle(activeCLITheme.accent)
 	applyTextareaTheme(&m.input)
 }
 
+// describeCLIThemes 生成所有可用主题样式的描述文本，用于 /theme 命令的帮助输出。
+// 当前活跃的样式前会有 "›" 标记。
 func describeCLIThemes() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s  auto · light · dark\n", dim("modes:"))
@@ -498,6 +559,8 @@ func describeCLIThemes() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// themeArgItems 为 /theme 命令提供自动补全候选列表，包括三个模式选项（auto/light/dark）
+// 和所有样式变体名称。返回候选项列表、插入位置和是否需要补全。
 func (m *chatTUI) themeArgItems(val string) ([]compItem, int, bool) {
 	cmdEnd := strings.IndexAny(val, " \t")
 	if cmdEnd < 0 || val[:cmdEnd] != "/theme" {

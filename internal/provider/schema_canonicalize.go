@@ -1,3 +1,17 @@
+// schema_canonicalize.go 实现了 JSON Schema 的规范化，确保相同的逻辑 Schema
+// 始终产生相同的字节表示。
+//
+// 主要用途:
+//   - 稳定 prefix-cache 键: 规范化后的 Schema 序列化结果一致，提高缓存命中率
+//   - 修复非标准 Schema: 某些 MCP 服务器发出 OpenAPI 风格的属性元数据
+//     （如 {"required": true}），需要转换为 JSON Schema 的数组形式
+//   - 处理空 Schema: 无参数工具返回空 Schema 时，填充合法的 {"type":"object"}
+//     避免 json.Marshal 失败
+//
+// 规范化规则:
+//   - 对 properties/$defs/definitions 等命名 Schema 映射的值递归规范化
+//   - 对 required/dependentRequired 等数组字段排序（sortSchemaArray）
+//   - 删除不合法的 required 字段（非数组形式）
 package provider
 
 import (
@@ -5,8 +19,8 @@ import (
 	"sort"
 )
 
-// CanonicalizeSchema recursively stabilizes a JSON Schema so the same logical
-// schema always produces the same byte representation.
+// CanonicalizeSchema 递归规范化 JSON Schema，确保相同的逻辑 Schema 产生相同的字节表示。
+// 空 Schema 填充为 {"type":"object"}，解析失败时原样返回。
 func CanonicalizeSchema(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		// A tool with no parameters (common for MCP tools) yields an empty
@@ -69,6 +83,8 @@ func canonicalizeSchemaObject(v any) any {
 	}
 }
 
+// canonicalizeNamedSchemas 规范化命名 Schema 映射（如 properties、$defs）。
+// 对映射中的每个 Schema 递归调用 canonicalizeSchemaObject。
 func canonicalizeNamedSchemas(v any) any {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -80,6 +96,8 @@ func canonicalizeNamedSchemas(v any) any {
 	return m
 }
 
+// canonicalizeDependentRequired 规范化 dependentRequired 字段。
+// 确保每个值都是已排序的字符串数组，非法值被删除。
 func canonicalizeDependentRequired(v any) any {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -100,6 +118,8 @@ func isJSONObject(v any) bool {
 	return ok
 }
 
+// sortSchemaArray 对 Schema 数组进行稳定排序，按 JSON 序列化后的字符串比较。
+// 排序确保 required 等数组字段的顺序一致，提高缓存命中率。
 func sortSchemaArray(arr []any) {
 	sort.SliceStable(arr, func(i, j int) bool {
 		return schemaJSONString(arr[i]) < schemaJSONString(arr[j])

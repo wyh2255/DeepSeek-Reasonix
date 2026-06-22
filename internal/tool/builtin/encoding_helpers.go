@@ -7,9 +7,8 @@ import (
 	fileenc "reasonix/internal/fileutil/encoding"
 )
 
-// readFileEncoded reads a file and decodes its encoding to UTF-8.
-// Returns the decoded content and the detected encoding kind so callers
-// can re-encode on write to preserve the original charset.
+// readFileEncoded 读取文件并将其编码解码为 UTF-8。
+// 返回解码后的内容和检测到的编码类型，以便调用者在写入时重新编码以保留原始字符集。
 func readFileEncoded(path string) (content string, enc fileenc.Kind, err error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -19,16 +18,16 @@ func readFileEncoded(path string) (content string, enc fileenc.Kind, err error) 
 	return string(fileenc.Decode(b, enc)), enc, nil
 }
 
-// writeFileEncoded encodes content back to the given encoding and writes it.
+// writeFileEncoded 将内容编码回指定编码格式并写入文件。
 func writeFileEncoded(path string, content string, enc fileenc.Kind) error {
 	return os.WriteFile(path, fileenc.Encode(content, enc), 0o644)
 }
 
-// matchLineEndings adapts an edit's old/new text to a CRLF file when the literal
-// old_string isn't present but its CRLF form is. read_file strips '\r' (bufio
-// ScanLines), so a model's multi-line old_string arrives LF-only while a
-// Windows/CJK source stores '\r\n'; rewriting search and replacement to the
-// file's ending fixes the match without rewriting the file's other line endings.
+// matchLineEndings 适配编辑的 old/new 文本到 CRLF 文件的行尾风格。
+//
+// 背景：read_file 使用 bufio.ScanLines 会剥离 '\r'，所以模型生成的多行 old_string
+// 只有 LF 行尾，而 Windows/CJK 源文件可能使用 '\r\n'。
+// 此函数将搜索和替换文本转换为文件的行尾风格，修复匹配问题而不改写文件的其他行尾。
 func matchLineEndings(content, old, new string) (string, string) {
 	if strings.Contains(content, old) || !strings.Contains(content, "\r\n") {
 		return old, new

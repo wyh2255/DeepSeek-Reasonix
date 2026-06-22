@@ -2,11 +2,10 @@ package permission
 
 import "strings"
 
-// readOnlyBashCommands is the set of commands considered read-only — they
-// don't modify filesystem state, network state, or process state. Each
-// entry is the first word of a bash command (lowercased). Commands not in
-// this set that might also be read-only (e.g. "git log") are handled
-// separately by isReadOnlyBashSubject.
+// readOnlyBashCommands 是被认为只读的命令集合。
+// 这些命令不会修改文件系统状态、网络状态或进程状态。
+// 每个条目是 bash 命令的第一个单词（小写形式）。
+// 不在此集合中但也可能是只读的命令（如 "git log"）由 isReadOnlyBashSubject 单独处理。
 var readOnlyBashCommands = map[string]bool{
 	"cat": true, "head": true, "tail": true, "less": true, "more": true,
 	"ls": true, "find": true, "locate": true, "which": true, "whereis": true, "type": true,
@@ -23,9 +22,8 @@ var readOnlyBashCommands = map[string]bool{
 	"basename": true, "dirname": true, "realpath": true, "readlink": true,
 }
 
-// readOnlyBashPrefixes are command prefixes where the second word
-// determines read-only status. Each maps to the set of read-only
-// subcommands.
+// readOnlyBashPrefixes 是需要检查第二个单词来判断只读状态的命令前缀集合。
+// 外层键是主命令（如 "git"），内层键是只读子命令（如 "log", "status"）。
 var readOnlyBashPrefixes = map[string]map[string]bool{
 	"git": {
 		"log": true, "status": true, "diff": true, "show": true,
@@ -56,9 +54,14 @@ var readOnlyBashPrefixes = map[string]map[string]bool{
 	},
 }
 
-// isReadOnlyBashSubject returns true when a bash command is a known
-// read-only operation. The subject is the JSON arg value extracted by
-// Subject() — for bash it is the raw command string.
+// isReadOnlyBashSubject 判断一个 bash 命令是否是已知的只读操作。
+// subject 是通过 Subject() 从 JSON 参数中提取的值 — 对于 bash 就是原始命令字符串。
+//
+// 判断逻辑：
+//  1. 检查是否包含 shell 语法（管道、重定向等），包含则非只读
+//  2. 检查第一个单词是否在 readOnlyBashCommands 集合中
+//  3. 检查是否匹配 readOnlyBashPrefixes 中的前缀+子命令组合
+//  4. 额外检查危险参数（如 find -exec, sort -o 等会破坏只读性）
 func isReadOnlyBashSubject(subject string) bool {
 	cmd := strings.TrimSpace(subject)
 	if cmd == "" {
@@ -88,10 +91,14 @@ func isReadOnlyBashSubject(subject string) bool {
 	return false
 }
 
+// containsShellSyntax 检查命令是否包含 shell 特殊语法（管道、重定向、命令替换等）。
+// 包含这些语法的命令不能被视为只读，因为它们可能产生不可预测的副作用。
 func containsShellSyntax(cmd string) bool {
 	return strings.ContainsAny(cmd, ";|&<>\n`") || strings.Contains(cmd, "$(")
 }
 
+// hasUnsafeReadOnlyArgs 检查看似只读的命令是否携带了危险参数。
+// 例如 "find -exec" 虽然 find 本身是只读命令，但 -exec 参数会执行外部命令。
 func hasUnsafeReadOnlyArgs(base string, args []string) bool {
 	switch base {
 	case "find":
@@ -108,6 +115,8 @@ func hasUnsafeReadOnlyArgs(base string, args []string) bool {
 	return false
 }
 
+// hasUnsafePrefixArgs 检查前缀命令的子命令是否携带了危险参数。
+// 例如 "git diff --output" 会写入文件，破坏只读性。
 func hasUnsafePrefixArgs(base, subcmd string, args []string) bool {
 	switch base {
 	case "git":
@@ -143,9 +152,8 @@ func hasAnyArg(args []string, unsafe ...string) bool {
 	return false
 }
 
-// dangerousBashPatterns are glob-like patterns that match destructive
-// commands. Used only for a UI warning — the deny list is the actual
-// enforcement mechanism.
+// dangerousBashPatterns 是匹配破坏性命令的 glob 模式列表。
+// 仅用于 UI 警告提示 — deny 列表才是实际的执行拦截机制。
 var dangerousBashPatterns = []struct {
 	pattern string
 	label   string
@@ -167,9 +175,8 @@ var dangerousBashPatterns = []struct {
 	{"> /dev/*", "device overwrite"},
 }
 
-// BashDangerWarning returns a short label if subject matches a known
-// dangerous pattern, or "" when the command looks safe. This is a visual
-// hint only — the Policy rules are the authority.
+// BashDangerWarning 如果命令匹配已知的危险模式则返回简短标签，否则返回 ""。
+// 这只是一个视觉提示 — Policy 规则才是真正的权限判断依据。
 func BashDangerWarning(subject string) string {
 	s := strings.TrimSpace(subject)
 	for _, d := range dangerousBashPatterns {

@@ -1,3 +1,7 @@
+// upgrade.go 实现了 CLI 的自动升级命令（reasonix upgrade / reasonix update）。
+// 功能流程：从 GitHub Releases API 获取最新版本 -> 与当前版本比较 ->
+// 下载对应平台的归档文件 -> SHA256 校验 -> 解压二进制 -> 原子替换当前可执行文件。
+// 支持 .tar.gz（Linux/macOS）和 .zip（Windows）两种归档格式。
 package cli
 
 import (
@@ -26,27 +30,29 @@ import (
 )
 
 const (
-	ghOwner        = "esengine"
-	ghRepo         = "DeepSeek-Reasonix"
-	ghAPIReleases  = "https://api.github.com/repos/" + ghOwner + "/" + ghRepo + "/releases"
-	ghDownloadBase = "https://github.com/" + ghOwner + "/" + ghRepo + "/releases/download"
-	upgradeTimeout = 60 * time.Second
+	ghOwner        = "esengine"                                                    // GitHub 仓库所有者
+	ghRepo         = "DeepSeek-Reasonix"                                           // GitHub 仓库名
+	ghAPIReleases  = "https://api.github.com/repos/" + ghOwner + "/" + ghRepo + "/releases"   // Releases API 地址
+	ghDownloadBase = "https://github.com/" + ghOwner + "/" + ghRepo + "/releases/download"    // 下载基础 URL
+	upgradeTimeout = 60 * time.Second                                              // HTTP 请求超时时间
 )
 
-// ghRelease is the subset of the GitHub release API response we need.
+// ghRelease 是 GitHub Release API 响应的子集，仅包含标签名和资源列表。
 type ghRelease struct {
 	TagName string `json:"tag_name"`
 	Assets  []ghAsset
 }
 
-// ghAsset is a single release asset.
+// ghAsset 表示一个 Release 资源文件（如 reasonix-linux-amd64.tar.gz）。
 type ghAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
 }
 
-// upgradeCommand handles `reasonix upgrade` (and `reasonix update`).
+// upgradeCommand 处理 "reasonix upgrade"（及 "reasonix update"）命令。
+// 支持 --check（仅检查不安装）和 --force（强制重装当前版本）参数。
+// 返回 0 表示成功，1 表示错误，2 表示参数解析失败。
 func upgradeCommand(args []string, version string) int {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	checkOnly := fs.Bool("check", false, "check for updates without installing")
@@ -164,7 +170,8 @@ func upgradeCommand(args []string, version string) int {
 	return 0
 }
 
-// normalizeVersion returns v as valid semver ("vX.Y.Z") or ok=false for dev.
+// normalizeVersion 将版本字符串规范化为 semver 格式（"vX.Y.Z"）。
+// 空字符串或 "dev" 视为开发版本，返回 ok=false。
 func normalizeVersion(v string) (string, bool) {
 	v = strings.TrimSpace(v)
 	if v == "" || v == "dev" {
@@ -179,18 +186,16 @@ func normalizeVersion(v string) (string, bool) {
 	return semver.Canonical(v), true
 }
 
-// isCLITag reports whether a tag belongs to the CLI release namespace (v*).
-// Tags like "desktop-v1.5.0" or "npm-v1.4.0" are excluded.
+// isCLITag 判断标签是否属于 CLI 发布命名空间（v* 开头后跟数字）。
+// 排除 "desktop-v1.5.0"、"npm-v1.4.0" 等其他命名空间的标签。
 func isCLITag(tag string) bool {
 	tag = strings.TrimSpace(tag)
 	return len(tag) >= 2 && tag[0] == 'v' && tag[1] >= '0' && tag[1] <= '9'
 }
 
-// pickCLIRelease returns the newest CLI-namespace (v*) release from a
-// reverse-chronological list, skipping foreign namespaces ("desktop-v",
-// "npm-v"). Prereleases are kept: only 1.x carries `reasonix upgrade`, and the
-// 1.x line ships as rc on npm @next, so there is no stable user to hold back —
-// the command should always move to the newest 1.x.
+// pickCLIRelease 从按时间倒序排列的 Release 列表中选取最新的 CLI 命名空间（v*）Release。
+// 跳过 "desktop-v"、"npm-v" 等其他命名空间。保留预发布版本，因为 1.x 系列
+// 通过 npm @next 发布为 rc 版，没有稳定版用户需要顾虑。
 func pickCLIRelease(rels []ghRelease) *ghRelease {
 	for i := range rels {
 		if isCLITag(rels[i].TagName) {
@@ -200,8 +205,7 @@ func pickCLIRelease(rels []ghRelease) *ghRelease {
 	return nil
 }
 
-// fetchLatestRelease queries the GitHub Releases API and returns the newest
-// CLI-namespace (v*) release.
+// fetchLatestRelease 查询 GitHub Releases API，返回最新的 CLI 命名空间 Release。
 func fetchLatestRelease(c *http.Client) (*ghRelease, error) {
 	req, err := http.NewRequest("GET", ghAPIReleases, nil)
 	if err != nil {
@@ -230,7 +234,7 @@ func fetchLatestRelease(c *http.Client) (*ghRelease, error) {
 	return nil, fmt.Errorf("no CLI release (v*) found in recent releases")
 }
 
-// fetchBytes GETs a URL fully into memory.
+// fetchBytes 通过 HTTP GET 请求将 URL 内容完整下载到内存中。
 func fetchBytes(c *http.Client, url string) ([]byte, error) {
 	resp, err := c.Get(url)
 	if err != nil {
@@ -243,8 +247,8 @@ func fetchBytes(c *http.Client, url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// verifyChecksum checks that data's SHA256 matches the entry for fileName in
-// the SHA256SUMS-format checksum file.
+// verifyChecksum 校验下载数据的 SHA256 哈希值是否与 SHA256SUMS 文件中对应条目匹配。
+// 不匹配则返回错误，条目不存在也返回错误（fail-closed 策略）。
 func verifyChecksum(data []byte, fileName string, checksumFile []byte) error {
 	sum := sha256.Sum256(data)
 	got := hex.EncodeToString(sum[:])
@@ -265,7 +269,7 @@ func verifyChecksum(data []byte, fileName string, checksumFile []byte) error {
 	return fmt.Errorf(i18n.M.UpgradeChecksumNotFoundFmt, fileName)
 }
 
-// extractBinary pulls the "reasonix" binary from a .tar.gz or .zip archive.
+// extractBinary 根据归档文件扩展名选择解压方式，从 .tar.gz 或 .zip 中提取指定的二进制文件。
 func extractBinary(data []byte, archiveName, binaryName string) ([]byte, error) {
 	if strings.HasSuffix(archiveName, ".zip") {
 		return extractFromZip(data, binaryName)
@@ -273,7 +277,7 @@ func extractBinary(data []byte, archiveName, binaryName string) ([]byte, error) 
 	return extractFromTarGz(data, binaryName)
 }
 
-// extractFromTarGz extracts a named binary from a .tar.gz archive.
+// extractFromTarGz 从 .tar.gz 归档中解压指定名称的二进制文件。
 func extractFromTarGz(data []byte, name string) ([]byte, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -296,7 +300,7 @@ func extractFromTarGz(data []byte, name string) ([]byte, error) {
 	return nil, fmt.Errorf("%q not found in archive", name)
 }
 
-// extractFromZip extracts a named binary from a .zip archive (Windows).
+// extractFromZip 从 .zip 归档中解压指定名称的二进制文件（主要用于 Windows 平台）。
 func extractFromZip(data []byte, name string) ([]byte, error) {
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -358,10 +362,10 @@ func replaceBinary(newBin []byte) error {
 	return nil
 }
 
-// commitWindows performs the two-phase rename on Windows:
-//  1. Rename running exe → .old (allowed while running)
-//  2. Rename .new → target
-//  3. Best-effort remove .old (hide if still locked)
+// commitWindows 在 Windows 上执行两阶段替换：
+//  1. 将正在运行的 exe 重命名为 .old（运行中允许重命名）
+//  2. 将 .new 重命名为目标文件
+//  3. 尝试删除 .old（若仍被锁定则隐藏该文件）
 func commitWindows(target, newPath, base, dir string) error {
 	oldPath := filepath.Join(dir, fmt.Sprintf(".%s.old", base))
 
@@ -391,7 +395,7 @@ func commitWindows(target, newPath, base, dir string) error {
 	return nil
 }
 
-// resolveSymlinks follows symlinks; falls back to the original path on error.
+// resolveSymlinks 解析符号链接，失败时回退返回原始路径。
 func resolveSymlinks(p string) (string, error) {
 	r, err := filepath.EvalSymlinks(p)
 	if err != nil {
@@ -400,7 +404,7 @@ func resolveSymlinks(p string) (string, error) {
 	return r, nil
 }
 
-// humanSize returns a human-readable byte size.
+// humanSize 将字节数转换为人类可读的大小格式（B / KiB / MiB）。
 func humanSize(b int64) string {
 	const (
 		_KiB = 1024

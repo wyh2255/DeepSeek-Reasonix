@@ -1,3 +1,6 @@
+// rewind.go 实现了 TUI 中的 Esc-Esc / "/rewind" 回退选择器覆盖层。
+// 它允许用户浏览会话的检查点（每个 turn 一个），选择要恢复的 turn 和恢复范围
+// （对话+代码、仅对话、仅代码、分支、摘要等）。
 package cli
 
 import (
@@ -13,10 +16,9 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// rewindPicker is the in-chat overlay for Esc-Esc / "/rewind". Stage 0 lists the
-// session's turns (one checkpoint each); stage 1 picks what to restore for the
-// chosen turn. It mirrors the chooser overlay: keys route through handleRewindKey
-// and it renders via renderRewind while m.rewind is set.
+// rewindPicker 是 Esc-Esc / "/rewind" 的交互式覆盖层。阶段 0 列出会话的
+// turn（每个对应一个检查点）；阶段 1 为选定的 turn 选择恢复方式。
+// 按键通过 handleRewindKey 路由，渲染通过 renderRewind 完成，当 m.rewind 非 nil 时激活。
 type rewindPicker struct {
 	metas []checkpoint.Meta
 	sel   int // selected turn (index into metas)
@@ -24,6 +26,8 @@ type rewindPicker struct {
 	scope int // index into rewindScopes (stage 1)
 }
 
+// rewindActions 定义了回退选择器第二阶段的所有可用操作，
+// 包括恢复对话+代码、仅对话、仅代码、分支、从该点摘要、摘要到该点。
 var rewindActions = []struct {
 	kind  string // "scope" | "fork" | "summ-from" | "summ-upto"
 	scope control.RewindScope
@@ -36,8 +40,8 @@ var rewindActions = []struct {
 	{"summ-upto", 0},
 }
 
-// openRewind populates the picker from the session's checkpoints, selecting the
-// most recent turn. A no-op (with a notice) when there is nothing to rewind.
+// openRewind 从会话的检查点列表中填充回退选择器，默认选中最新的 turn。
+// 当没有可回退的内容时，显示通知并返回（不打开选择器）。
 func (m *chatTUI) openRewind() {
 	metas := m.ctrl.Checkpoints()
 	if len(metas) == 0 {
@@ -47,6 +51,8 @@ func (m *chatTUI) openRewind() {
 	m.rewind = &rewindPicker{metas: metas, sel: len(metas) - 1}
 }
 
+// handleRewindKey 处理回退选择器中的按键事件。阶段 0 用 ↑/↓/Enter 选择 turn；
+// 阶段 1 用 ↑/↓/Enter 或快捷键（b/c/d/f/s/u）选择恢复操作，Esc 返回上一阶段或关闭。
 func (m chatTUI) handleRewindKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	r := m.rewind
 	switch msg.String() {
@@ -112,6 +118,9 @@ func (m chatTUI) handleRewindKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// applyRewind 执行回退选择器的确认操作，根据选择的操作类型调用控制器的
+// Fork、SummarizeFrom、SummarizeUpTo 或 Rewind 方法。
+// 对话/代码恢复后会将该 turn 的提示词预填到输入框中，方便用户重新发送或编辑。
 func (m chatTUI) applyRewind() (tea.Model, tea.Cmd) {
 	r := m.rewind
 	meta := r.metas[r.sel]
@@ -147,6 +156,8 @@ func (m chatTUI) applyRewind() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// renderRewind 渲染回退选择器的界面。阶段 0 显示 turn 列表；
+// 阶段 1 显示选定 turn 的恢复操作列表，使用 choicePanelStyle 样式化输出。
 func (m chatTUI) renderRewind() string {
 	r := m.rewind
 	if r == nil {
@@ -171,6 +182,7 @@ func (m chatTUI) renderRewind() string {
 	return choicePanelStyle.Width(w).Render(b.String())
 }
 
+// rewindActionLabel 根据操作索引返回对应的本地化标签文本。
 func rewindActionLabel(i int) string {
 	switch i {
 	case 0:
@@ -190,6 +202,7 @@ func rewindActionLabel(i int) string {
 	}
 }
 
+// turnLabel 生成 turn 列表中每行的标签文本，包含提示词预览和修改文件数。
 func turnLabel(meta checkpoint.Meta, w int) string {
 	label := oneLine(meta.Prompt, max(20, w-30))
 	if n := len(meta.Paths); n > 0 {
@@ -202,7 +215,7 @@ func turnLabel(meta checkpoint.Meta, w int) string {
 	return label
 }
 
-// oneLine flattens s to a single line and truncates it to display width n.
+// oneLine 将多行文本压缩为单行，并截断到显示宽度 n。
 func oneLine(s string, n int) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
 	if s == "" {

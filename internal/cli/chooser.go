@@ -1,3 +1,11 @@
+// chooser.go 实现了 CLI 中的多选题交互组件，即 "ask" 工具的问题卡片。
+// 当 AI 通过 ask 工具向用户提出选择题时，chooser 负责：
+//   - 渲染问题卡片（支持多问题标签页切换）
+//   - 处理键盘交互（选项选择、自由文本输入、提交）
+//   - 收集用户回答并返回给 AI 继续执行
+//
+// 支持单选、多选、自由文本输入三种回答方式。
+
 package cli
 
 import (
@@ -26,6 +34,8 @@ type chooser struct {
 	typing    bool           // entering a free-text answer (keys go to the textarea)
 }
 
+// newChooser 根据 Ask 事件创建新的选择器实例。
+// 初始化问题列表、每题的选择状态和自定义文本输入。
 func newChooser(a event.Ask) *chooser {
 	c := &chooser{
 		id:        a.ID,
@@ -39,6 +49,7 @@ func newChooser(a event.Ask) *chooser {
 	return c
 }
 
+// onSubmitTab 判断当前是否处于提交标签页（最后一个标签页）。
 func (c *chooser) onSubmitTab() bool { return c.tab >= len(c.questions) }
 
 // rowCount is the rows of the current question: one per option, then a "Type
@@ -50,8 +61,10 @@ func (c *chooser) rowCount() int {
 	return len(c.questions[c.tab].Options) + 2
 }
 
+// answered 判断第 i 个问题是否已回答（有选择项或有自定义文本）。
 func (c *chooser) answered(i int) bool { return len(c.sel[i]) > 0 || c.custom[i] != "" }
 
+// allAnswered 判断所有问题是否都已回答完毕。
 func (c *chooser) allAnswered() bool {
 	for i := range c.questions {
 		if !c.answered(i) {
@@ -131,6 +144,7 @@ func (m chatTUI) handleChooserKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			c.cursor++
 		}
 	case " ", "space":
+		// 空格键用于多选题中切换选项的选中状态
 		if c.cursor < len(q.Options) && q.Multi {
 			c.sel[c.tab][c.cursor] = !c.sel[c.tab][c.cursor]
 			c.custom[c.tab] = ""
@@ -138,7 +152,7 @@ func (m chatTUI) handleChooserKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		return m.chooserActivate(c.cursor)
 	default:
-		// number keys 1..9 jump to / pick an option
+		// 数字键 1-9 可快速跳转到对应选项
 		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
 			if idx := int(s[0] - '1'); idx < len(q.Options) {
 				return m.chooserActivate(idx)
@@ -201,6 +215,11 @@ func (m chatTUI) chooserAnswer(answers []event.AskAnswer) (tea.Model, tea.Cmd) {
 // renderChooser draws the pinned question card: a tab strip (when more than one
 // question), the current question's prompt and options, and the Type-something /
 // Chat-about-this rows. On the Submit tab it shows a review of the picks.
+// renderChooser 渲染问题卡片的完整界面，包括：
+// - 标签页栏（多问题时显示）
+// - 当前问题的提示文本和选项列表
+// - "输入自定义回答" 和 "跳过直接对话" 行
+// - 提交标签页的回答摘要
 func (m chatTUI) renderChooser() string {
 	c := m.chooser
 	if c == nil {
@@ -249,6 +268,8 @@ func (m chatTUI) renderChooser() string {
 	return choicePanelStyle.Width(w).Render(b.String())
 }
 
+// chooserTabs 渲染标签页栏，显示所有问题的标题和完成状态。
+// 已回答的问题显示 ✔ 标记，当前标签页使用反色高亮。
 func (m chatTUI) chooserTabs() string {
 	c := m.chooser
 	parts := make([]string, 0, len(c.questions)+1)
@@ -312,6 +333,7 @@ func rowLine(cur bool, num int, box, label string, active bool) string {
 	return prefix + body
 }
 
+// headerOr 返回问题的标题文本，如果没有设置标题则使用默认的 "Q1"、"Q2" 格式。
 func headerOr(q event.AskQuestion, i int) string {
 	if q.Header != "" {
 		return q.Header

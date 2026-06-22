@@ -1,3 +1,5 @@
+// memory_view.go 负责将记忆集合（文档、自动记忆、已归档记忆）渲染为
+// 终端友好的格式化文本，供 /memory 命令在 TUI 滚动区域中展示。
 package cli
 
 import (
@@ -8,6 +10,9 @@ import (
 	"reasonix/internal/memory"
 )
 
+// renderMemory 将记忆集合渲染为格式化的终端文本，包括已加载的文档、
+// 已保存的自动记忆条目、已归档条目，以及编辑提示。
+// width 参数用于控制输出宽度，确保文本不超出终端边界。
 func renderMemory(width int, set *memory.Set) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", viewHeader("%s", strings.TrimRight(i18n.M.MemoryLoaded, ":：")))

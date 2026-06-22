@@ -1,3 +1,13 @@
+// effort.go 实现了推理努力级别（Reasoning Effort）的配置和管理。
+//
+// 推理努力级别控制模型在生成回复时投入的推理深度。
+// 不同的 AI 提供商使用不同的协议来表达这一概念：
+//   - DeepSeek: thinking.type 字段（high/max）
+//   - OpenAI: reasoning_effort 字段（low/medium/high）
+//   - Anthropic: extended thinking budget（low/medium/high/xhigh/max）
+//   - MiniMax: thinking 开关（adaptive/disabled）
+//
+// 用户通过 /effort 命令设置级别，配置层负责规范化、验证和映射到具体提供商的协议。
 package config
 
 import (
@@ -7,35 +17,39 @@ import (
 	"reasonix/internal/provider/openai"
 )
 
+// 推理协议常量，标识提供商使用的推理控制协议。
 const (
-	ReasoningProtocolAuto     = "auto"
-	ReasoningProtocolDeepSeek = "deepseek"
-	ReasoningProtocolOpenAI   = "openai"
-	ReasoningProtocolNone     = "none"
+	ReasoningProtocolAuto     = "auto"     // 自动检测（根据提供商类型和模型名推断）
+	ReasoningProtocolDeepSeek = "deepseek" // DeepSeek 协议（thinking.type）
+	ReasoningProtocolOpenAI   = "openai"   // OpenAI 协议（reasoning_effort）
+	ReasoningProtocolNone     = "none"     // 不支持推理控制
 )
 
-// EffortCapability describes the abstract effort levels a provider/model can set
-// through the /effort command.
+// EffortCapability 描述提供商/模型通过 /effort 命令可设置的抽象努力级别。
 type EffortCapability struct {
-	Supported bool
-	Levels    []string
-	Default   string
+	Supported bool     // 是否支持努力级别配置
+	Levels    []string // 可用的级别列表（包含 "auto"）
+	Default   string   // 默认级别
 }
 
+// modelReasoningCapability 描述特定模型的推理能力配置。
 type modelReasoningCapability struct {
-	Protocol string
-	Levels   []string
-	Default  string
+	Protocol string   // 使用的推理协议
+	Levels   []string // 支持的级别
+	Default  string   // 默认级别
 }
 
+// modelReasoningCapabilities 是已知模型的推理能力注册表。
+// 用于在没有显式配置时自动推断模型的推理能力。
 var modelReasoningCapabilities = map[string]modelReasoningCapability{
 	"deepseek-v4-flash": {Protocol: ReasoningProtocolDeepSeek, Levels: []string{"high", "max"}, Default: "high"},
 	"deepseek-v4-pro":   {Protocol: ReasoningProtocolDeepSeek, Levels: []string{"high", "max"}, Default: "high"},
 }
 
-// EffortCapabilityForEntry returns the user-facing /effort levels for a resolved
-// provider entry. Provider implementations still decide how a stored effort is
-// serialized into requests.
+// EffortCapabilityForEntry 返回已解析的提供商条目对应的用户可见 /effort 级别。
+// 提供商实现仍然决定如何将存储的 effort 值序列化为请求参数。
+//
+// 优先级：显式配置 > 模型能力注册表 > 端点类型推断 > 通用默认值
 func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
 	if explicitReasoningProtocol(e) == ReasoningProtocolNone {
 		return EffortCapability{}
@@ -81,8 +95,14 @@ func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
 	}
 }
 
-// NormalizeEffort maps a user-supplied /effort level into the value stored in
-// config. Empty means auto/provider default.
+// NormalizeEffort 将用户通过 /effort 命令输入的级别映射为存储在配置中的值。
+// 空字符串表示使用自动/提供商默认值。
+//
+// 不同提供商的级别映射：
+//   - DeepSeek: high/max（low/medium 映射到 high，xhigh 映射到 max）
+//   - OpenAI: low/medium/high
+//   - MiniMax: adaptive/disabled（其他级别映射到最近的有效值）
+//   - Anthropic: low/medium/high/xhigh/max
 func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
 	level := normalizeEffortLevel(raw)
 	if level == "" {
@@ -152,8 +172,7 @@ func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
 	}
 }
 
-// EffortDisplay returns the selected /effort level, using "auto" for provider
-// default.
+// EffortDisplay 返回当前选中的 /effort 级别，提供商默认值显示为 "auto"。
 func EffortDisplay(e *ProviderEntry) string {
 	if e == nil || strings.TrimSpace(e.Effort) == "" {
 		return "auto"
@@ -161,10 +180,12 @@ func EffortDisplay(e *ProviderEntry) string {
 	return normalizeEffortLevel(e.Effort)
 }
 
-// EffectiveEffort resolves the provider-visible effort value. Explicit
-// ProviderEntry.Effort wins; otherwise a configured SupportedEfforts list makes
-// DefaultEffort (or the first supported level) the runtime default. Empty means
-// provider default / omit the provider-specific effort field.
+// EffectiveEffort 解析提供商可见的 effort 值。
+//
+// 优先级：
+//  1. 显式的 ProviderEntry.Effort（用户通过 /effort 设置）
+//  2. 配置的 SupportedEfforts 列表中的 DefaultEffort（或第一个支持的级别）
+//  3. 空字符串 = 使用提供商默认值 / 省略提供商特定的 effort 字段
 func EffectiveEffort(e *ProviderEntry) string {
 	if e == nil {
 		return ""
@@ -210,9 +231,12 @@ func normalizeStoredEffort(raw string) string {
 	return level
 }
 
-// ReasoningProtocolForEntry resolves the provider request shape for reasoning
-// controls. Explicit config wins, then the model capability registry, then legacy
-// endpoint heuristics.
+// ReasoningProtocolForEntry 解析提供商的推理控制协议。
+//
+// 优先级：
+//  1. 显式配置的 ReasoningProtocol
+//  2. 模型能力注册表中的协议
+//  3. 旧版端点启发式检测（如 DeepSeek API 端点）
 func ReasoningProtocolForEntry(e *ProviderEntry) string {
 	if explicit := explicitReasoningProtocol(e); explicit != "" {
 		return explicit

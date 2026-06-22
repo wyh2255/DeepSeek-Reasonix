@@ -1,3 +1,6 @@
+// reasoning_language.go 实现了 TUI 中的 /reasoning-language 子命令，
+// 用于查看和设置推理语言模式（auto/zh/en），
+// 并将用户选择持久化到配置文件。
 package cli
 
 import (
@@ -7,6 +10,9 @@ import (
 	"reasonix/internal/config"
 )
 
+// runReasoningLanguageCommand 处理 "/reasoning-language" 命令。
+// 无参数时显示当前推理语言模式；带参数时解析并持久化设置，
+// 同时在运行中的控制器上生效。支持 auto、zh、en 三种模式。
 func (m *chatTUI) runReasoningLanguageCommand(input string) {
 	args := tokenizeArgs(input)
 	if len(args) < 2 {
@@ -54,6 +60,8 @@ func (m *chatTUI) runReasoningLanguageCommand(input string) {
 	m.notice(fmt.Sprintf("reasoning-language set to %s", mode))
 }
 
+// parseCLIReasoningLanguage 解析用户输入的推理语言模式字符串，
+// 返回规范化的模式名称。仅接受 auto、zh、en 三种值。
 func parseCLIReasoningLanguage(mode string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "auto":
@@ -67,6 +75,8 @@ func parseCLIReasoningLanguage(mode string) (string, error) {
 	}
 }
 
+// cliReasoningLanguageMode 将配置中的推理语言模式规范化为标准值（auto/zh/en），
+// 未知值默认返回 "auto"。
 func cliReasoningLanguageMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "zh":

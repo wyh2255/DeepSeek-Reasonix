@@ -1,3 +1,6 @@
+// memory.go 实现了 TUI 中的 /memory 和 /forget 子命令。
+// /memory 展示当前加载的记忆文档和自动记忆存储路径，
+// /forget 按名称删除已保存的自动记忆条目。
 package cli
 
 import (
@@ -6,10 +9,9 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// showMemory reports what memory is loaded and where it lives — the TUI analog
-// of Claude Code's /memory. It surfaces the doc files and the auto-memory store
-// path so the user can open and edit them directly, since the in-terminal UI
-// doesn't shell out to an editor.
+// showMemory 报告当前加载了哪些记忆以及它们的存储位置，是 Claude Code /memory 命令的
+// TUI 对应实现。它展示文档文件和自动记忆存储路径，方便用户直接打开编辑，
+// 因为终端内 UI 不会调用外部编辑器。
 func (m *chatTUI) showMemory() {
 	set := m.ctrl.Memory()
 	if set == nil || (set.Empty() && len(set.Store.ListArchived()) == 0) {
@@ -19,8 +21,8 @@ func (m *chatTUI) showMemory() {
 	m.commitLine(renderMemory(m.width, set))
 }
 
-// forgetMemory deletes a saved auto-memory by name (the slug shown in /memory).
-// It is the manual counterpart to the model's `forget` tool.
+// forgetMemory 按名称（即 /memory 中显示的 slug）删除已保存的自动记忆。
+// 它是模型 `forget` 工具的手动对应操作。
 func (m *chatTUI) forgetMemory(name string) {
 	if name == "" {
 		m.notice(i18n.M.ForgetUsage)

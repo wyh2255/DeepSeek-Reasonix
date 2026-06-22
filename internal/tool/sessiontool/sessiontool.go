@@ -1,8 +1,11 @@
-// Package sessiontool provides list_sessions and read_session tools that let
-// the AI discover and read past conversation sessions, enabling cross-session
-// AI context sharing. The tools reuse agent.ListSessionOrder, agent.LoadSession,
-// and agent.IsCleanupPending — the same infrastructure used by the history
-// tool and session picker — to avoid duplicating session-file logic.
+// Package sessiontool 提供 list_sessions 和 read_session 两个工具，
+// 让 AI 能够发现和读取过去的对话会话，实现跨会话的上下文共享。
+//
+// 这两个工具复用了 agent 包中的 ListSessionOrder、LoadSession 和 IsCleanupPending
+// 函数（与历史工具和会话选择器相同的基础设施），避免重复实现会话文件逻辑。
+//
+// list_sessions：列出所有保存的会话，返回时间戳、模型、轮次、预览和文件名。
+// read_session：按文件名读取指定会话的对话内容，支持隐私保护（默认隐藏工具结果）。
 package sessiontool
 
 import (
@@ -16,13 +19,15 @@ import (
 	"reasonix/internal/provider"
 )
 
-// ---- list_sessions tool -----------------------------------------------------
+// ---- list_sessions 工具 -----------------------------------------------------
 
+// listSessionsTool 实现了 list_sessions 工具，列出所有保存的对话会话。
 type listSessionsTool struct {
-	sessionDir string
+	sessionDir string // 会话文件存储目录
 }
 
-// NewListSessionsTool creates a tool that lists saved sessions.
+// NewListSessionsTool 创建一个 list_sessions 工具实例。
+// sessionDir 是会话文件的存储目录路径。
 func NewListSessionsTool(sessionDir string) *listSessionsTool {
 	return &listSessionsTool{sessionDir: sessionDir}
 }
@@ -62,13 +67,16 @@ func (t *listSessionsTool) Execute(_ context.Context, _ json.RawMessage) (string
 	return b.String(), nil
 }
 
-// ---- read_session tool ------------------------------------------------------
+// ---- read_session 工具 ------------------------------------------------------
 
+// readSessionTool 实现了 read_session 工具，按文件名读取指定会话的对话内容。
+// 提供隐私安全的视图：每条消息截断到 2000 字符，不显示推理内容、系统提示和工具结果。
 type readSessionTool struct {
-	sessionDir string
+	sessionDir string // 会话文件存储目录
 }
 
-// NewReadSessionTool creates a tool that reads saved sessions.
+// NewReadSessionTool 创建一个 read_session 工具实例。
+// sessionDir 是会话文件的存储目录路径。
 func NewReadSessionTool(sessionDir string) *readSessionTool {
 	return &readSessionTool{sessionDir: sessionDir}
 }
@@ -197,10 +205,10 @@ loop:
 	return b.String(), nil
 }
 
-// ---- helpers ----------------------------------------------------------------
+// ---- 辅助函数 ----------------------------------------------------------------
 
-// truncateRunes truncates a string to at most max runes, matching the
-// history.Searcher.renderMessage truncation policy.
+// truncateRunes 将字符串截断到最多 max 个 rune（Unicode 字符），超出部分以 "..." 结尾。
+// 与 history.Searcher.renderMessage 的截断策略保持一致。
 func truncateRunes(s string, max int) string {
 	s = strings.TrimSpace(s)
 	runes := []rune(s)
@@ -210,8 +218,9 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max]) + "..."
 }
 
-// modelFromPath extracts the model name from a session file path.
-// Filename format: "20060102-150405.000000000-model-name.jsonl"
+// modelFromPath 从会话文件路径中提取模型名称。
+// 文件名格式："20060102-150405.000000000-model-name.jsonl"
+// 通过跳过前两个 "-" 分隔的部分（日期和时间戳）来提取模型名。
 func modelFromPath(path string) string {
 	name := filepath.Base(path)
 	name = strings.TrimSuffix(name, ".jsonl")

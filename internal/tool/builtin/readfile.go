@@ -1,5 +1,26 @@
-// Package builtin provides Reasonix's compile-time built-in tools. Each tool
-// self-registers via init(); main blank-imports this package to wire them in.
+// Package builtin 提供 Reasonix 的编译时内置工具。
+//
+// 每个工具通过 init() 函数自注册到 tool 包的全局注册表中。
+// main 包通过空白导入 _ "reasonix/internal/tool/builtin" 来触发这些注册。
+//
+// 内置工具列表：
+//   - bash: 执行 shell 命令
+//   - read_file: 读取文本文件（带行号）
+//   - write_file: 写入文件（覆盖）
+//   - edit_file: 精确字符串替换编辑
+//   - multi_edit: 批量原子编辑
+//   - move_file: 移动/重命名文件
+//   - notebook_edit: 编辑 Jupyter 笔记本单元格
+//   - delete_range: 删除文本范围
+//   - delete_symbol: 删除 Go 源码符号
+//   - grep: 正则搜索文件内容
+//   - glob: 按模式匹配文件名
+//   - ls: 列出目录内容
+//   - web_fetch: 获取网页内容
+//   - bash_output / kill_shell / wait: 后台作业管理
+//   - todo_write: 任务列表管理
+//   - complete_step: 完成步骤记录
+//   - code_index: 代码符号索引
 package builtin
 
 import (
@@ -25,9 +46,15 @@ const (
 
 func init() { tool.RegisterBuiltin(readFile{}) }
 
-// readFile reads a text file. workDir, when non-empty, is the directory a
-// relative path is resolved against (see resolveIn); the zero value registered
-// at init resolves against the process working directory.
+// readFile 实现了 read_file 工具，读取文本文件并返回带行号的内容。
+//
+// 特性：
+//   - 支持 UTF-8、UTF-16（LE/BE）、GBK 等编码自动检测和转换
+//   - 输出每行带 1-based 行号前缀（如 "   42→..."），便于后续 edit_file 定位
+//   - 支持 offset/limit 分页浏览大文件
+//   - 自动拒绝二进制文件（检测 NUL 字节）
+//
+// workDir 非空时，相对路径基于该目录解析；零值（init 注册时）基于进程工作目录。
 type readFile struct{ workDir string }
 
 const (
@@ -161,7 +188,9 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 	return r.scan(src, p.Offset, p.Limit)
 }
 
-// scan reads lines from src and returns the formatted output with line numbers.
+// scan 从 src 读取行并返回带行号的格式化输出。
+// offset 是 0-based 起始行偏移，limit 是最大返回行数。
+// 超出 limit 的行不会继续读取（避免为计数而读完整个文件）。
 func (r readFile) scan(src io.Reader, offset, limit int) (string, error) {
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)

@@ -1,3 +1,8 @@
+// host.go 提供基于 URL 的提供者类型自动检测功能。
+//
+// 通过解析 base URL 的主机名，自动识别 DeepSeek 和 MiniMax 后端，
+// 以便选择正确的 thinking 协议和 reasoning_effort 格式。
+// 支持精确匹配（api.deepseek.com）和通配符子域名匹配（*.deepseek.com）。
 package openai
 
 import (
@@ -5,17 +10,15 @@ import (
 	"strings"
 )
 
-// matchesVendorHost reports whether baseURL points at one of the canonical
-// hostnames (exact match, case-insensitive) or at any subdomain of apex.
-// Returns false on any parse error or empty host.
+// matchesVendorHost 判断 baseURL 是否指向指定厂商的主机名。
 //
-// We take the apex separately from the canonical because they differ: the
-// canonical (e.g. api.minimaxi.com) is the specific endpoint, but regional
-// subdomains like eu.minimaxi.com or us.minimaxi.com should also match —
-// the wire shape is the same, just hosted in a different region. The bare
-// apex (e.g. minimaxi.com) is intentionally rejected: it would only happen
-// if the user pointed their base_url at the apex domain, which is a
-// misconfiguration — not a path we want to silently accept.
+// 匹配规则:
+//   - 精确匹配 canonical 列表中的主机名（如 api.minimaxi.com）
+//   - 通配符子域名匹配 apex（如 *.minimaxi.com → eu.minimaxi.com、us.minimaxi.com）
+//   - 裸 apex 域名（如 minimaxi.com）故意不匹配——这是配置错误
+//
+// 区分 canonical 和 apex 的原因：canonical 是特定端点，apex 用于子域名通配；
+// 区域子域名（如 eu.minimaxi.com）的 wire 格式与主域名相同，只是托管在不同区域。
 func matchesVendorHost(baseURL, apex string, canonical ...string) bool {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -30,17 +33,14 @@ func matchesVendorHost(baseURL, apex string, canonical ...string) bool {
 	return strings.HasSuffix(host, "."+apex)
 }
 
-// IsDeepSeek reports whether baseURL points at DeepSeek's API
-// (api.deepseek.com or any *.deepseek.com subdomain).
+// IsDeepSeek 判断 baseURL 是否指向 DeepSeek API（api.deepseek.com 或 *.deepseek.com）。
 func IsDeepSeek(baseURL string) bool {
 	return matchesVendorHost(baseURL, "deepseek.com", "api.deepseek.com")
 }
 
-// IsMiniMax reports whether baseURL points at MiniMax's OpenAI-compatible
-// endpoint (api.minimaxi.com or any *.minimaxi.com subdomain).
+// IsMiniMax 判断 baseURL 是否指向 MiniMax 的 OpenAI 兼容端点（api.minimaxi.com 或 *.minimaxi.com）。
 //
-// The host string is matched exactly — the spelling is `minimaxi`, not
-// `minimax` — to avoid clashing with any future minimax-branded gateway.
+// 主机名精确匹配 "minimaxi"（而非 "minimax"），避免与未来的 minimax 品牌网关冲突。
 func IsMiniMax(baseURL string) bool {
 	return matchesVendorHost(baseURL, "minimaxi.com", "api.minimaxi.com")
 }

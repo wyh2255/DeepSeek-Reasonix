@@ -1,3 +1,5 @@
+// provider.go 实现了 TUI 中的 /provider 子命令，用于列出已配置的 Provider、
+// 切换到指定 Provider 的默认模型（或多模型时提示用户选择）。
 package cli
 
 import (
@@ -8,10 +10,9 @@ import (
 	"reasonix/internal/i18n"
 )
 
-// runProviderCommand handles "/provider": with no argument it lists the configured
-// providers and marks the active one; "/provider <name>" switches to that
-// provider's default model (or prompts the user to pick one when multiple models
-// are configured).
+// runProviderCommand 处理 "/provider" 命令：无参数时列出所有已配置的 Provider
+// 并标记当前活跃的；"/provider <name>" 切换到该 Provider 的默认模型
+// （若配置了多个模型则提示用户选择）。
 func (m *chatTUI) runProviderCommand(input string) {
 	args := tokenizeArgs(input) // args[0] == "/provider"
 	if len(args) < 2 {
@@ -22,8 +23,7 @@ func (m *chatTUI) runProviderCommand(input string) {
 	m.switchToProvider(name)
 }
 
-// showProviders lists all configured providers, marking the one backing the
-// current model.
+// showProviders 列出所有已配置的 Provider，标记当前模型所属的 Provider。
 func (m *chatTUI) showProviders() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -66,10 +66,9 @@ func (m *chatTUI) showProviders() {
 	m.commitLine(strings.Join(lines, "\n"))
 }
 
-// switchToProvider switches the session to the named provider's default model.
-// If the provider has multiple models, it shows an interactive picker (in the
-// setup/CLI style) if running in a TTY, or falls back to a notice listing
-// available models.
+// switchToProvider 将当前会话切换到指定 Provider 的默认模型。
+// 若该 Provider 配置了多个模型，则在 TUI 中显示可用模型列表，
+// 提示用户通过 /model 命令选择具体模型。
 func (m *chatTUI) switchToProvider(name string) {
 	cfg, err := config.Load()
 	if err != nil {

@@ -1,8 +1,16 @@
-// Package config loads Reasonix's runtime configuration from TOML. Resolution order:
-// flag > project ./reasonix.toml > user config.toml (in the OS user-config dir) > built-in defaults.
-// User-global runtime controls, such as agent step limits, are documented exceptions.
-// Secrets come from the environment via api_key_env and are never stored in
-// config files.
+// Package config 负责从 TOML 文件加载 Reasonix 的运行时配置。
+//
+// 配置解析优先级（从高到低）：
+//  1. 命令行标志（flag）
+//  2. 项目级 ./reasonix.toml
+//  3. 用户级 config.toml（位于 OS 用户配置目录）
+//  4. 内置默认值
+//
+// 用户全局运行时控制（如智能体步数限制）是文档化的例外情况。
+// 敏感信息（如 API 密钥）通过 api_key_env 从环境变量获取，绝不存储在配置文件中。
+//
+// 配置文件格式为 TOML，使用 github.com/BurntSushi/toml 库解析。
+// 支持 ${VAR} 和 ${VAR:-default} 环境变量扩展。
 package config
 
 import (
@@ -23,12 +31,27 @@ import (
 	"reasonix/internal/provider"
 )
 
+// validSkillName 是技能名称的正则表达式验证规则。
+// 要求：以字母或数字开头，可包含字母、数字、点、下划线、连字符，长度 1-64。
 var validSkillName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
-// IsValidSkillName reports whether name is a usable skill identifier.
+// IsValidSkillName 检查名称是否为可用的技能标识符。
+// 技能标识符要求：以字母或数字开头，可包含字母、数字、点、下划线、连字符，长度 1-64。
+//
+// 参数：
+//   - name: 要检查的技能名称
+//
+// 返回值：true 表示名称有效
 func IsValidSkillName(name string) bool { return validSkillName.MatchString(name) }
 
-// SkillNameKey normalizes a skill identifier for config comparisons.
+// SkillNameKey 规范化技能标识符用于配置比较。
+// 在 Windows 上转为小写（因为文件系统不区分大小写），其他平台保持原样。
+// 无效的名称返回空字符串。
+//
+// 参数：
+//   - name: 原始技能名称
+//
+// 返回值：规范化的名称（用于比较），无效名称返回空字符串
 func SkillNameKey(name string) string {
 	name = strings.TrimSpace(name)
 	if !IsValidSkillName(name) {
@@ -40,36 +63,52 @@ func SkillNameKey(name string) string {
 	return name
 }
 
-// Config is Reasonix's runtime configuration.
+// Config 是 Reasonix 的运行时配置主结构体。
+// 包含所有可配置的选项，从 TOML 文件加载并合并。
+//
+// 配置层级：
+//   - 顶层：全局设置（默认模型、语言、凭证存储等）
+//   - UI/Desktop: 界面相关设置（主题、语言、布局等）
+//   - Agent: 智能体行为设置（系统提示、步数限制、温度等）
+//   - Providers: 模型提供者列表（API 地址、密钥、模型等）
+//   - Tools: 工具配置（启用的工具、超时等）
+//   - Permissions: 权限策略（允许/询问/拒绝规则）
+//   - Sandbox: 沙箱配置（写入限制、bash 沙箱等）
+//   - Network: 网络配置（代理设置）
+//   - Plugins: MCP 插件列表
+//   - Skills: 技能发现配置
+//   - LSP: 语言服务器协议配置
+//   - Bot: 多渠道 IM 机器人配置
 type Config struct {
-	ConfigVersion    int                 `toml:"config_version"`
-	DefaultModel     string              `toml:"default_model"`
-	Language         string              `toml:"language"` // ui/model language tag (e.g. "zh"); empty = auto-detect from $LANG / $REASONIX_LANG
-	CredentialsStore string              `toml:"credentials_store"`
-	UI               UIConfig            `toml:"ui"`
-	Desktop          DesktopConfig       `toml:"desktop"`
-	Notifications    NotificationsConfig `toml:"notifications"`
-	Agent            AgentConfig         `toml:"agent"`
-	Providers        []ProviderEntry     `toml:"providers"`
-	Tools            ToolsConfig         `toml:"tools"`
-	Permissions      PermissionsConfig   `toml:"permissions"`
-	Sandbox          SandboxConfig       `toml:"sandbox"`
-	Network          NetworkConfig       `toml:"network"`
-	Plugins          []PluginEntry       `toml:"plugins"`
-	Skills           SkillsConfig        `toml:"skills"`
-	Statusline       StatuslineConfig    `toml:"statusline"`
-	LSP              LSPConfig           `toml:"lsp"`
-	Bot              BotConfig           `toml:"bot"`
+	ConfigVersion    int                 `toml:"config_version"`    // 配置文件版本号，用于迁移检测
+	DefaultModel     string              `toml:"default_model"`     // 默认模型引用（如 "deepseek" 或 "deepseek/deepseek-v4-flash"）
+	Language         string              `toml:"language"`          // UI/模型语言标签（如 "zh"），空则从 $LANG/$REASONIX_LANG 自动检测
+	CredentialsStore string              `toml:"credentials_store"` // 凭证存储模式（auto/legacy）
+	UI               UIConfig            `toml:"ui"`               // CLI 界面设置（主题、快捷键布局等）
+	Desktop          DesktopConfig       `toml:"desktop"`          // 桌面端 UI 设置（布局、主题、遥测等）
+	Notifications    NotificationsConfig `toml:"notifications"`    // 系统通知设置
+	Agent            AgentConfig         `toml:"agent"`            // 智能体行为设置（系统提示、步数、温度等）
+	Providers        []ProviderEntry     `toml:"providers"`        // 模型提供者列表
+	Tools            ToolsConfig         `toml:"tools"`            // 工具配置（启用列表、超时等）
+	Permissions      PermissionsConfig   `toml:"permissions"`      // 权限策略（允许/询问/拒绝规则）
+	Sandbox          SandboxConfig       `toml:"sandbox"`          // 沙箱配置（写入限制、bash 沙箱等）
+	Network          NetworkConfig       `toml:"network"`          // 网络配置（代理设置）
+	Plugins          []PluginEntry       `toml:"plugins"`          // MCP 插件列表
+	Skills           SkillsConfig        `toml:"skills"`           // 技能发现配置
+	Statusline       StatuslineConfig    `toml:"statusline"`       // 自定义状态行配置
+	LSP              LSPConfig           `toml:"lsp"`              // 语言服务器协议配置
+	Bot              BotConfig           `toml:"bot"`              // 多渠道 IM 机器人配置
 
-	providerSources          map[string]providerSourceScope
-	shadowedProjectProviders []ProviderEntry
+	providerSources          map[string]providerSourceScope // 提供者来源（user/project），用于合并策略
+	shadowedProjectProviders []ProviderEntry                // 被用户级配置遮蔽的项目级提供者
 }
 
+// providerSourceScope 标识提供者的配置来源。
 type providerSourceScope string
 
 const (
-	providerSourceUser    providerSourceScope = "user"
-	providerSourceProject providerSourceScope = "project"
+	providerSourceUser    providerSourceScope = "user"    // 来自用户级配置（~/.reasonix/config.toml）
+	providerSourceProject providerSourceScope = "project" // 来自项目级配置（./reasonix.toml）
 )
 
 // UIConfig controls CLI presentation-only settings. Desktop appearance is kept in
@@ -109,7 +148,9 @@ type NotificationsConfig struct {
 	AskRequest      bool `toml:"ask_request"`
 }
 
-// UITheme normalizes ui.theme to a supported value.
+// UITheme 规范化 ui.theme 为支持的值（"auto"|"dark"|"light"）。
+//
+// 返回值：规范化后的主题字符串
 func (c *Config) UITheme() string {
 	switch strings.ToLower(strings.TrimSpace(c.UI.Theme)) {
 	case "dark":
@@ -121,15 +162,17 @@ func (c *Config) UITheme() string {
 	}
 }
 
-// UIThemeStyle normalizes ui.theme_style. Empty means "pick the default style
-// for the resolved light/dark shell".
+// UIThemeStyle 规范化 ui.theme_style。空表示"为解析后的亮/暗 shell 选择默认风格"。
+//
+// 返回值：规范化后的主题风格字符串
 func (c *Config) UIThemeStyle() string {
 	return normalizeThemeStyle(c.UI.ThemeStyle)
 }
 
-// UIShortcutLayout normalizes the legacy CLI shortcut layout setting. It is kept
-// for compatibility; Shift+Tab toggles Plan and Ctrl+Y toggles YOLO in both
-// layouts.
+// UIShortcutLayout 规范化旧版 CLI 快捷键布局设置。保留用于兼容性；
+// Shift+Tab 切换 Plan，Ctrl+Y 切换 YOLO 在两种布局中都有效。
+//
+// 返回值：规范化后的布局字符串（"classic"|"desktop"）
 func (c *Config) UIShortcutLayout() string {
 	switch strings.ToLower(strings.TrimSpace(c.UI.ShortcutLayout)) {
 	case "desktop", "dual", "dual-axis", "dual_axis":
@@ -170,9 +213,10 @@ func normalizeCloseBehavior(mode string) string {
 	}
 }
 
-// DesktopLanguage normalizes the desktop UI language. Empty means auto-detect
-// from the browser/OS locale; it deliberately does not read top-level language,
-// which is used by the CLI/model-facing runtime.
+// DesktopLanguage 规范化桌面端 UI 语言。空表示从浏览器/OS 区域设置自动检测；
+// 故意不读取顶层 language，后者用于 CLI/模型面向的运行时。
+//
+// 返回值：规范化后的语言字符串（"en"|"zh" 或空）
 func (c *Config) DesktopLanguage() string {
 	switch strings.ToLower(strings.TrimSpace(c.Desktop.Language)) {
 	case "en":
@@ -184,8 +228,10 @@ func (c *Config) DesktopLanguage() string {
 	}
 }
 
-// DesktopTheme normalizes desktop.theme. New desktop users default to the OS
-// automatic graphite product look; an explicit auto/light/dark is preserved.
+// DesktopTheme 规范化 desktop.theme。新桌面用户默认为 OS 自动 graphite 产品外观；
+// 显式的 auto/light/dark 被保留。
+//
+// 返回值：规范化后的主题字符串
 func (c *Config) DesktopTheme() string {
 	switch strings.ToLower(strings.TrimSpace(c.Desktop.Theme)) {
 	case "auto":
@@ -214,9 +260,10 @@ func (c *Config) DesktopLayoutStyle() string {
 	return normalizeDesktopLayoutStyle(c.Desktop.LayoutStyle)
 }
 
-// DesktopCloseBehavior normalizes the desktop close-window preference. It falls
-// back to the legacy ui.close_behavior value for configs written before [desktop]
-// existed.
+// DesktopCloseBehavior 规范化桌面关闭窗口偏好。回退到旧版 ui.close_behavior 值，
+// 用于 [desktop] 存在之前编写的配置。
+//
+// 返回值：规范化后的行为字符串（"quit"|"background"）
 func (c *Config) DesktopCloseBehavior() string {
 	if strings.TrimSpace(c.Desktop.CloseBehavior) != "" {
 		return normalizeCloseBehavior(c.Desktop.CloseBehavior)
@@ -229,8 +276,9 @@ func (c *Config) UICloseBehavior() string {
 	return c.DesktopCloseBehavior()
 }
 
-// DesktopDisplayMode normalizes the transcript display mode. Default is
-// "standard" (flat rendering, no folding).
+// DesktopDisplayMode 规范化转录显示模式。默认为 "standard"（扁平渲染，无折叠）。
+//
+// 返回值：规范化后的显示模式（"standard"|"compact"）
 func (c *Config) DesktopDisplayMode() string {
 	switch strings.ToLower(strings.TrimSpace(c.Desktop.DisplayMode)) {
 	case "standard":
@@ -242,8 +290,10 @@ func (c *Config) DesktopDisplayMode() string {
 	}
 }
 
-// DesktopStatusBarStyle normalizes the desktop status bar metric label style.
-// Default is "text"; explicit "icon" preserves the user's compact choice.
+// DesktopStatusBarStyle 规范化桌面状态栏指标标签样式。默认为 "text"；
+// 显式的 "icon" 保留用户的紧凑选择。
+//
+// 返回值：规范化后的样式（"icon"|"text"）
 func (c *Config) DesktopStatusBarStyle() string {
 	switch strings.ToLower(strings.TrimSpace(c.Desktop.StatusBarStyle)) {
 	case "icon":
@@ -281,15 +331,17 @@ func desktopStatusBarItemSet(items []string) map[string]bool {
 	return out
 }
 
-// DefaultDesktopStatusBarItems returns the default ordered visible desktop
-// status bar items.
+// DefaultDesktopStatusBarItems 返回默认的有序可见桌面状态栏项目列表。
+//
+// 返回值：默认状态栏项目列表
 func DefaultDesktopStatusBarItems() []string {
 	return append([]string(nil), defaultDesktopStatusBarItems...)
 }
 
-// DesktopStatusBarItems normalizes the ordered visible desktop status bar items.
-// An unset or empty list uses the default full set; explicit non-empty lists
-// preserve user order and omit hidden items.
+// DesktopStatusBarItems 规范化有序可见桌面状态栏项目。
+// 未设置或空列表使用默认完整集合；显式非空列表保留用户顺序并省略隐藏项目。
+//
+// 返回值：规范化后的状态栏项目列表
 func (c *Config) DesktopStatusBarItems() []string {
 	return normalizeDesktopStatusBarItems(c.Desktop.StatusBarItems)
 }
@@ -311,8 +363,10 @@ func normalizeDesktopStatusBarItems(items []string) []string {
 	return out
 }
 
-// DesktopCheckUpdates reports whether the desktop should check for updates on
-// startup. Missing configs default to true so existing users keep update notices.
+// DesktopCheckUpdates 检查桌面端是否应在启动时检查更新。
+// 缺失配置默认为 true，使现有用户继续收到更新通知。
+//
+// 返回值：true 表示启用更新检查
 func (c *Config) DesktopCheckUpdates() bool {
 	if c == nil || c.Desktop.CheckUpdates == nil {
 		return true
@@ -320,9 +374,10 @@ func (c *Config) DesktopCheckUpdates() bool {
 	return *c.Desktop.CheckUpdates
 }
 
-// ColdResumePruneEnabled reports whether stale tool results are elided when a
-// session resumes past the provider cache window. Default true (cheaper cold
-// restart); users keep full history by disabling it.
+// ColdResumePruneEnabled 检查当会话恢复超过提供者缓存窗口时是否省略过期的工具结果。
+// 默认 true（冷启动更便宜）；用户可通过禁用来保留完整历史。
+//
+// 返回值：true 表示启用冷恢复修剪
 func (c *Config) ColdResumePruneEnabled() bool {
 	if c == nil || c.Agent.ColdResumePrune == nil {
 		return true
@@ -330,9 +385,10 @@ func (c *Config) ColdResumePruneEnabled() bool {
 	return *c.Agent.ColdResumePrune
 }
 
-// ReasoningLanguage normalizes agent.reasoning_language. Empty means auto:
-// visible reasoning follows the conversation language already described by the
-// stable LanguagePolicy. Legacy "default" is treated as auto.
+// ReasoningLanguage 规范化 agent.reasoning_language。空值表示自动：
+// 可见推理遵循 LanguagePolicy 描述的对话语言。旧版 "default" 视为自动。
+//
+// 返回值：规范化后的推理语言（"auto"|"zh"|"en"）
 func (c *Config) ReasoningLanguage() string {
 	if c == nil {
 		return "auto"
@@ -340,7 +396,13 @@ func (c *Config) ReasoningLanguage() string {
 	return NormalizeReasoningLanguage(c.Agent.ReasoningLanguage)
 }
 
-// NormalizeReasoningLanguage returns one of auto|zh|en.
+// NormalizeReasoningLanguage 将各种语言标识规范化为 auto|zh|en 之一。
+// 支持多种别名（如 "cn"/"chinese"/"中文" → "zh"）。
+//
+// 参数：
+//   - lang: 原始语言标识
+//
+// 返回值：规范化后的语言标识
 func NormalizeReasoningLanguage(lang string) string {
 	switch strings.ToLower(strings.TrimSpace(lang)) {
 	case "", "auto", "follow", "conversation", "detect", "default", "model", "model-default", "model_default", "provider":
@@ -354,8 +416,10 @@ func NormalizeReasoningLanguage(lang string) string {
 	}
 }
 
-// DesktopTelemetry reports whether the desktop sends the anonymous launch ping.
-// It carries no conversation, key, or file data — see desktop/README.md.
+// DesktopTelemetry 检查桌面端是否发送匿名启动 ping。
+// 不携带对话、密钥或文件数据——见 desktop/README.md。
+//
+// 返回值：true 表示启用遥测
 func (c *Config) DesktopTelemetry() bool {
 	if c == nil || c.Desktop.Telemetry == nil {
 		return true
@@ -363,8 +427,10 @@ func (c *Config) DesktopTelemetry() bool {
 	return *c.Desktop.Telemetry
 }
 
-// DesktopMetrics reports whether the desktop sends aggregate desktop metrics —
-// anonymous (signal, bucket) counters, never content. Default on.
+// DesktopMetrics 检查桌面端是否发送聚合桌面指标——
+// 匿名（信号、桶）计数器，不包含内容。默认开启。
+//
+// 返回值：true 表示启用指标收集
 func (c *Config) DesktopMetrics() bool {
 	if c == nil || c.Desktop.Metrics == nil {
 		return true
@@ -497,22 +563,19 @@ type BotConnectionSessionMapping struct {
 	UpdatedAt     string `toml:"updated_at"`
 }
 
-// NetworkConfig controls ordinary outbound HTTP traffic such as model providers,
-// wallet-balance lookups, updater checks, CodeGraph downloads, and web_fetch.
-// web_fetch reuses these proxy settings while keeping its own SSRF-guarded
-// dialer.
+// NetworkConfig 控制普通的出站 HTTP 流量，如模型提供者、钱包余额查询、
+// 更新检查、CodeGraph 下载和 web_fetch。web_fetch 复用这些代理设置，
+// 同时保持自己的 SSRF 防护拨号器。
 type NetworkConfig struct {
-	// ProxyMode is "auto" (default; environment proxy for now), "env", "custom",
-	// or "off". auto leaves room for OS proxy detection later without changing the
-	// config shape.
+	// ProxyMode 代理模式："auto"（默认；目前使用环境代理）、"env"、"custom" 或 "off"。
+	// auto 为将来的 OS 代理检测留出空间，无需更改配置形状。
 	ProxyMode string `toml:"proxy_mode"`
-	// ProxyURL is an advanced custom override such as "socks5://127.0.0.1:7890".
-	// When set and proxy_mode = "custom", it wins over the structured proxy table.
+	// ProxyURL 高级自定义覆盖，如 "socks5://127.0.0.1:7890"。
+	// 设置且 proxy_mode = "custom" 时，优先于结构化代理表。
 	ProxyURL string `toml:"proxy_url"`
-	// NoProxy is honored for custom proxies. Env/auto modes use NO_PROXY from the
-	// process environment instead.
+	// NoProxy 对自定义代理生效。env/auto 模式使用进程环境中的 NO_PROXY。
 	NoProxy string             `toml:"no_proxy"`
-	Proxy   NetworkProxyConfig `toml:"proxy"`
+	Proxy   NetworkProxyConfig `toml:"proxy"` // 结构化代理配置
 }
 
 // NetworkProxyConfig is the structured custom-proxy editor shape. Password is
@@ -525,7 +588,10 @@ type NetworkProxyConfig struct {
 	Password string `toml:"password"`
 }
 
-// NetworkProxySpec returns the expanded proxy settings used by netclient.
+// NetworkProxySpec 返回 netclient 使用的扩展代理设置。
+// 所有支持 ${VAR} 扩展的字段都已展开。
+//
+// 返回值：代理规范结构体
 func (c *Config) NetworkProxySpec() netclient.ProxySpec {
 	return netclient.ProxySpec{
 		Mode:        c.Network.ProxyMode,
@@ -571,27 +637,29 @@ func (c *Config) directProxyHosts() []string {
 	return out
 }
 
-// NetworkProxyMode normalizes network.proxy_mode to a known value.
+// NetworkProxyMode 规范化 network.proxy_mode 为已知值。
+//
+// 返回值：规范化后的代理模式字符串
 func (c *Config) NetworkProxyMode() string {
 	return netclient.NormalizeMode(c.Network.ProxyMode)
 }
 
-// SkillsConfig configures skill discovery. Paths adds extra "custom"-scope skill
-// roots — each a directory of SKILL.md / <name>.md playbooks — scanned between
-// the project roots (.reasonix/.agents/.agent/.claude under the workspace) and
-// the global roots. ExcludedPaths hides matching discovery roots without deleting
-// folders. ~, relative paths, and ${VAR} expansion are supported. DisabledSkills
-// hides named skills from the agent prompt, slash invocation, and skill tools
-// while keeping them manageable.
+// SkillsConfig 配置技能发现。Paths 添加额外的"自定义"范围技能根目录——
+// 每个都是 SKILL.md / <name>.md 剧本的目录——在项目根目录
+// （工作区下的 .reasonix/.agents/.agent/.claude）和全局根目录之间扫描。
+// ExcludedPaths 隐藏匹配的发现根目录而不删除文件夹。
+// 支持 ~、相对路径和 ${VAR} 扩展。DisabledSkills 从智能体提示、
+// 斜杠调用和技能工具中隐藏命名技能，同时保持它们可管理。
 type SkillsConfig struct {
-	Paths          []string `toml:"paths"`
-	ExcludedPaths  []string `toml:"excluded_paths"`
-	DisabledSkills []string `toml:"disabled_skills"`
-	MaxDepth       int      `toml:"max_depth"`
+	Paths          []string `toml:"paths"`           // 额外的自定义技能根目录
+	ExcludedPaths  []string `toml:"excluded_paths"`   // 隐藏的技能发现根目录
+	DisabledSkills []string `toml:"disabled_skills"`  // 禁用的技能名称列表
+	MaxDepth       int      `toml:"max_depth"`        // 嵌套技能发现的最大深度（默认 3，最大 5）
 }
 
-// SkillCustomPaths returns the configured custom skill roots with ${VAR}
-// expanded; empty entries are dropped.
+// SkillCustomPaths 返回配置的自定义技能根目录，${VAR} 已扩展；空条目被丢弃。
+//
+// 返回值：自定义技能根目录列表
 func (c *Config) SkillCustomPaths() []string {
 	var out []string
 	for _, p := range c.Skills.Paths {
@@ -614,8 +682,10 @@ func (c *Config) SkillExcludedPaths() []string {
 	return out
 }
 
-// SkillMaxDepth bounds nested skill discovery. Depth 3 favors bundled skill
-// packs while Store keeps nested markdown safe by requiring descriptions.
+// SkillMaxDepth 限制嵌套技能发现的深度。深度 3 有利于打包的技能包，
+// 同时 Store 通过要求描述来保持嵌套 markdown 的安全性。
+//
+// 返回值：最大深度（1-5，默认 3）
 func (c *Config) SkillMaxDepth() int {
 	const (
 		defaultDepth = 3
@@ -633,8 +703,10 @@ func (c *Config) SkillMaxDepth() int {
 	return c.Skills.MaxDepth
 }
 
-// DisabledSkillNames returns valid disabled skill identifiers, preserving the
-// first spelling and dropping duplicates/empty entries.
+// DisabledSkillNames 返回有效的禁用技能标识符，保留第一次出现的拼写，
+// 丢弃重复项和空条目。
+//
+// 返回值：禁用的技能名称列表
 func (c *Config) DisabledSkillNames() []string {
 	seen := map[string]bool{}
 	var out []string
@@ -653,7 +725,12 @@ func (c *Config) DisabledSkillNames() []string {
 	return out
 }
 
-// IsSkillDisabled reports whether name is configured as disabled.
+// IsSkillDisabled 检查指定名称的技能是否被配置为禁用。
+//
+// 参数：
+//   - name: 技能名称
+//
+// 返回值：true 表示技能已禁用
 func (c *Config) IsSkillDisabled(name string) bool {
 	key := SkillNameKey(name)
 	if key == "" {
@@ -667,30 +744,29 @@ func (c *Config) IsSkillDisabled(name string) bool {
 	return false
 }
 
-// SandboxConfig bounds the blast radius of tool calls (Phase 0: file-writer
-// confinement). WorkspaceRoot is the directory the built-in file writers
-// (write_file / edit_file / multi_edit / move_file) may modify; empty means the
-// current working directory, so writes stay inside the project by default.
-// AllowWrite lists extra directories writers may also touch (e.g. a sibling repo
-// or a temp dir). Both support ${VAR} / ${VAR:-default} expansion. Reads are
-// unrestricted; confining `bash` is Phase 1 (OS-level sandbox).
+// SandboxConfig 限制工具调用的影响范围（Phase 0：文件写入限制）。
+// WorkspaceRoot 是内置文件写入工具（write_file/edit_file/multi_edit/move_file）
+// 可以修改的目录；空表示当前工作目录，因此默认写入保留在项目内。
+// AllowWrite 列出写入工具还可以触及的额外目录（如兄弟仓库或临时目录）。
+// 两者都支持 ${VAR} / ${VAR:-default} 扩展。读取不受限制；
+// 限制 `bash` 是 Phase 1（OS 级沙箱）。
 type SandboxConfig struct {
-	WorkspaceRoot string   `toml:"workspace_root"`
-	AllowWrite    []string `toml:"allow_write"`
-	// Bash is the OS-sandbox mode for the bash tool: "enforce" (default) jails
-	// each command, "off" runs it unconfined. Phase 1; macOS only for now, with
-	// a graceful fallback elsewhere (see internal/sandbox).
+	WorkspaceRoot string   `toml:"workspace_root"` // 文件写入工具的工作区根目录
+	AllowWrite    []string `toml:"allow_write"`     // 额外允许写入的目录列表
+	// Bash 是 bash 工具的 OS 沙箱模式："enforce"（默认）限制每个命令，
+	// "off" 不限制运行。Phase 1；目前仅 macOS，其他平台优雅降级。
 	Bash string `toml:"bash"`
-	// Network allows network egress from inside the bash sandbox. Defaults true
-	// so module/package downloads keep working; the boundary is then writes.
+	// Network 允许从 bash 沙箱内进行网络出口。默认 true 使模块/包下载继续工作；
+	// 边界 then 是写入。
 	Network bool `toml:"network"`
 }
 
-// WriteRoots returns the directories file-writer tools may modify: the
-// workspace root (defaulting to the current working directory when unset), plus
-// any AllowWrite extras, with ${VAR} expanded. The roots are returned as given
-// (relative or absolute); the confiner resolves them to absolute, symlink-free
-// paths. The result is always non-empty, so confinement is on by default.
+// WriteRoots 返回文件写入工具可以修改的目录列表：
+// 工作区根目录（未设置时默认为当前工作目录），加上 AllowWrite 的额外目录，
+// ${VAR} 已扩展。根目录按原样返回（相对或绝对）；限制器将其解析为绝对、无符号链接的路径。
+// 结果始终非空，因此默认启用限制。
+//
+// 返回值：允许写入的目录列表
 func (c *Config) WriteRoots() []string {
 	return c.WriteRootsForRoot(".")
 }
@@ -719,9 +795,10 @@ func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
 	return roots
 }
 
-// BashMode normalises the bash-sandbox mode: only an explicit "off" disables
-// it; empty or any other value resolves to "enforce", so the sandbox is on by
-// default and fails safe.
+// BashMode 规范化 bash 沙箱模式：只有显式的 "off" 才禁用它；
+// 空值或任何其他值都解析为 "enforce"，因此沙箱默认开启且安全失败。
+//
+// 返回值："enforce" 或 "off"
 func (c *Config) BashMode() string {
 	if c.Sandbox.Bash == "off" {
 		return "off"
@@ -734,17 +811,21 @@ func (c *Config) BashMode() string {
 // planner handles low-frequency planning in its own session (kept separate so
 // each model's prompt prefix stays cache-stable). SubagentModel is the optional
 // default for runAs=subagent skills; SubagentModels overrides it per skill name.
+// AgentConfig 配置智能体的行为。PlannerModel 可选：设置为另一个提供者的名称时
+// 启用双模型协作，规划器在自己的会话中处理低频规划（保持分离以使每个模型的
+// 提示前缀保持缓存稳定）。SubagentModel 是 runAs=subagent 技能的可选默认值；
+// SubagentModels 可按技能名称覆盖。
 type AgentConfig struct {
-	SystemPrompt     string            `toml:"system_prompt"`
-	SystemPromptFile string            `toml:"system_prompt_file"`
-	MaxSteps         int               `toml:"max_steps"`         // tool-call rounds per turn; 0 = unlimited
-	PlannerMaxSteps  int               `toml:"planner_max_steps"` // planner read-only tool-call rounds; 0 = unlimited
-	Temperature      float64           `toml:"temperature"`
-	PlannerModel     string            `toml:"planner_model"`
-	SubagentModel    string            `toml:"subagent_model"`
-	SubagentModels   map[string]string `toml:"subagent_models"`
-	SubagentEffort   string            `toml:"subagent_effort"`
-	SubagentEfforts  map[string]string `toml:"subagent_efforts"`
+	SystemPrompt     string            `toml:"system_prompt"`       // 系统提示文本（直接嵌入）
+	SystemPromptFile string            `toml:"system_prompt_file"` // 系统提示文件路径（优先于 system_prompt）
+	MaxSteps         int               `toml:"max_steps"`          // 每轮工具调用轮次上限；0 = 无限制
+	PlannerMaxSteps  int               `toml:"planner_max_steps"`  // 规划器只读工具调用轮次上限；0 = 无限制
+	Temperature      float64           `toml:"temperature"`        // 模型温度参数
+	PlannerModel     string            `toml:"planner_model"`      // 规划器模型引用（用于双模型协作）
+	SubagentModel    string            `toml:"subagent_model"`     // 子智能体默认模型
+	SubagentModels   map[string]string `toml:"subagent_models"`    // 每技能的子智能体模型覆盖
+	SubagentEffort   string            `toml:"subagent_effort"`    // 子智能体默认推理深度
+	SubagentEfforts  map[string]string `toml:"subagent_efforts"`   // 每技能的子智能体推理深度覆盖
 	// OutputStyle selects a persona/tone block folded into the system prompt at
 	// startup (a built-in like "explanatory"/"learning"/"concise", or a custom
 	// .reasonix/output-styles/<name>.md). Empty = the unmodified prompt.
@@ -782,19 +863,22 @@ type AgentConfig struct {
 // ProviderEntry declares a model provider instance. ContextWindow is the model's
 // token budget; the harness compacts older history as a turn's prompt approaches
 // it (see agent compaction). 0 disables compaction for the instance.
+// ProviderEntry 声明一个模型提供者实例。
+// ContextWindow 是模型的 token 预算；当轮次的提示接近此值时，
+// 智能体会压缩旧历史（见 agent compaction）。0 禁用该实例的压缩。
 type ProviderEntry struct {
-	Name          string                       `toml:"name"`
-	Kind          string                       `toml:"kind"`
-	BaseURL       string                       `toml:"base_url"`
-	Model         string                       `toml:"model"`      // a single model (back-compat)
-	Models        []string                     `toml:"models"`     // a vendor's model list (one base_url/key, many models)
-	ModelsURL     string                       `toml:"models_url"` // auto-fetch models from this URL on startup
-	Default       string                       `toml:"default"`    // default model when Models is set (else Models[0])
-	APIKeyEnv     string                       `toml:"api_key_env"`
-	BalanceURL    string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
-	ContextWindow int                          `toml:"context_window"`
-	Price         *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
-	Prices        map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
+	Name          string                       `toml:"name"`           // 提供者名称（如 "deepseek"、"custom-token-xxx"）
+	Kind          string                       `toml:"kind"`           // 提供者类型（"openai"、"anthropic"）
+	BaseURL       string                       `toml:"base_url"`       // API 端点基础 URL
+	Model         string                       `toml:"model"`          // 单个模型（向后兼容）
+	Models        []string                     `toml:"models"`         // 供应商的模型列表（一个 base_url/key，多个模型）
+	ModelsURL     string                       `toml:"models_url"`     // 启动时从此 URL 自动获取模型列表
+	Default       string                       `toml:"default"`        // Models 设置时的默认模型（否则为 Models[0]）
+	APIKeyEnv     string                       `toml:"api_key_env"`    // API 密钥的环境变量名
+	BalanceURL    string                       `toml:"balance_url"`    // 可选：提供者特定的钱包余额端点。空 = 不读取余额
+	ContextWindow int                          `toml:"context_window"` // 模型的 token 上下文窗口大小
+	Price         *provider.Pricing            `toml:"price"`          // 旧版/提供者级回退价格
+	Prices        map[string]*provider.Pricing `toml:"prices"`         // 可选：每模型价格（键为模型 ID）
 	// Thinking / Effort are provider-kind-specific knobs forwarded to the provider
 	// via Config.Extra. The anthropic provider reads Thinking="adaptive" to enable
 	// extended thinking and Effort ("low".."max") to tune depth. The
@@ -835,8 +919,10 @@ type ProviderEntry struct {
 	NoProxy bool `toml:"no_proxy"`
 }
 
-// ModelList returns the models this provider exposes: the explicit `models` list,
-// or the single `model` as a one-element list (back-compat). Empty if neither set.
+// ModelList 返回此提供者暴露的模型列表：显式的 `models` 列表，
+// 或单个 `model` 作为单元素列表（向后兼容）。两者都未设置则返回 nil。
+//
+// 返回值：模型名称列表
 func (e *ProviderEntry) ModelList() []string {
 	if len(e.Models) > 0 {
 		return e.Models
@@ -847,20 +933,23 @@ func (e *ProviderEntry) ModelList() []string {
 	return nil
 }
 
-// IsLikelyChatModel reports whether a model ID looks like a chat/completion
-// model rather than a specialised audio/vision/embedding model. It applies a
-// conservative name-based heuristic — the OpenAI-compatible /models API does
-// not return capability/modality metadata, so this is the most reliable
-// fallback until providers add such fields.
+// IsLikelyChatModel 检查模型 ID 是否看起来像聊天/补全模型，
+// 而非专门的音频/视觉/嵌入模型。使用保守的基于名称的启发式方法——
+// OpenAI 兼容的 /models API 不返回能力/模态元数据，
+// 因此在提供者添加此类字段之前，这是最可靠的回退方案。
 //
-// The heuristic works in two passes:
-//  1. Multi-word substring check for compound terms that span separators
-//     (e.g. "text-embedding", "text-to-speech").
-//  2. Token-level check: the model ID is split on common separators (- _ . / :)
-//     and each token is compared against a set of known non-chat keywords.
+// 启发式检查分两步：
+//  1. 多词子串检查：检测跨分隔符的复合词（如 "text-embedding"、"text-to-speech"）
+//  2. 词元级检查：按常见分隔符（- _ . / :）分割模型 ID，
+//     将每个词元与已知的非聊天关键词集合比较
 //
-// "voice" is intentionally absent from the non-chat set because it is too
-// broad — legitimate future chat models may include it in their name.
+// 注意："voice" 故意不在非聊天集合中，因为它太宽泛——
+// 合法的未来聊天模型可能在名称中包含它。
+//
+// 参数：
+//   - model: 模型 ID 字符串
+//
+// 返回值：true 表示可能是聊天模型
 func IsLikelyChatModel(model string) bool {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -896,11 +985,12 @@ func IsLikelyChatModel(model string) bool {
 	return true
 }
 
-// ChatModelList returns ModelList filtered to likely chat/completion models.
-// Non-chat models (TTS, STT, ASR, embedding, etc.) are excluded so they do
-// not appear in the chat model picker. Use ModelList() only when the full
-// raw provider model list is needed, such as config serialization, provider
-// diagnostics, or model-fetch editing.
+// ChatModelList 返回过滤后的聊天/补全模型列表。
+// 排除非聊天模型（TTS、STT、ASR、嵌入等），使它们不出现在聊天模型选择器中。
+// 仅在需要完整的原始提供者模型列表时使用 ModelList()，
+// 如配置序列化、提供者诊断或模型获取编辑。
+//
+// 返回值：可能的聊天模型名称列表
 func (e *ProviderEntry) ChatModelList() []string {
 	raw := e.ModelList()
 	if len(raw) == 0 {
@@ -915,8 +1005,10 @@ func (e *ProviderEntry) ChatModelList() []string {
 	return out
 }
 
-// DefaultModel returns the provider's default model: the explicit `default`, else
-// the first of ModelList.
+// DefaultModel 返回提供者的默认模型：显式的 `default` 字段，
+// 否则 ModelList 的第一个元素。
+//
+// 返回值：默认模型名称
 func (e *ProviderEntry) DefaultModel() string {
 	if e.Default != "" {
 		return e.Default
@@ -927,7 +1019,12 @@ func (e *ProviderEntry) DefaultModel() string {
 	return ""
 }
 
-// HasModel reports whether m is one of the provider's models.
+// HasModel 检查指定模型是否为此提供者的模型之一。
+//
+// 参数：
+//   - m: 模型名称
+//
+// 返回值：true 表示包含该模型
 func (e *ProviderEntry) HasModel(m string) bool {
 	for _, x := range e.ModelList() {
 		if x == m {
@@ -937,8 +1034,13 @@ func (e *ProviderEntry) HasModel(m string) bool {
 	return false
 }
 
-// PriceForModel returns the configured per-1M-token price for model. Per-model
-// prices win; the legacy provider-wide price is a fallback for older configs.
+// PriceForModel 返回指定模型的配置价格（每百万 token）。
+// 每模型价格优先；旧版提供者级价格作为回退。
+//
+// 参数：
+//   - model: 模型名称
+//
+// 返回值：价格信息指针（未配置则返回 nil）
 func (e *ProviderEntry) PriceForModel(model string) *provider.Pricing {
 	if e == nil {
 		return nil
@@ -966,13 +1068,13 @@ func clonePricing(p *provider.Pricing) *provider.Pricing {
 	return &cp
 }
 
-// ToolsConfig selects which built-in tools are enabled. Empty means all of them.
+// ToolsConfig 选择启用哪些内置工具。空列表表示全部启用。
 type ToolsConfig struct {
-	Enabled            []string             `toml:"enabled"`
-	BashTimeoutSeconds *int                 `toml:"bash_timeout_seconds"`
-	BackgroundJobs     BackgroundJobsConfig `toml:"background_jobs"`
-	Search             SearchConfig         `toml:"search"`
-	Shell              ShellConfig          `toml:"shell"`
+	Enabled            []string             `toml:"enabled"`              // 启用的工具名称列表（空=全部启用）
+	BashTimeoutSeconds *int                 `toml:"bash_timeout_seconds"` // bash 工具超时秒数（nil=120s 默认值）
+	BackgroundJobs     BackgroundJobsConfig `toml:"background_jobs"`      // 后台作业配置
+	Search             SearchConfig         `toml:"search"`               // 搜索引擎配置（ripgrep/原生）
+	Shell              ShellConfig          `toml:"shell"`                // shell 解释器配置
 }
 
 const (
@@ -981,10 +1083,11 @@ const (
 	maxBackgroundJobStalledWarningSec     = 86400
 )
 
-// BashTimeoutSeconds returns the foreground bash timeout in seconds. An omitted
-// config keeps the historical 120s safety cap, explicit 0 disables the
-// tool-local cap, and positive values set a custom cap. Negative values fall
-// back to the default so a typo cannot silently remove the safety net.
+// BashTimeoutSeconds 返回前台 bash 超时（秒）。
+// 未配置时保持历史 120 秒安全上限；显式 0 禁用工具本地上限；
+// 正值设置自定义上限。负值回退到默认值，防止输入错误静默移除安全网。
+//
+// 返回值：超时秒数
 func (c *Config) BashTimeoutSeconds() int {
 	if c.Tools.BashTimeoutSeconds == nil || *c.Tools.BashTimeoutSeconds < 0 {
 		return defaultBashTimeoutSeconds
@@ -1029,33 +1132,31 @@ type ShellConfig struct {
 	Path   string `toml:"path"`
 }
 
-// PermissionsConfig declares the per-call permission policy (see
-// internal/permission). Mode is the fallback decision for writer tools when no
-// rule matches ("ask" | "allow" | "deny"; default "ask"); read-only tools always
-// fall back to allow. Allow/Ask/Deny are rule lists of the form "ToolName" or
-// "ToolName(glob)". Precedence: deny > ask > allow > fallback.
+// PermissionsConfig 声明每次调用的权限策略（见 internal/permission）。
+// Mode 是写入工具在无规则匹配时的回退决策（"ask"|"allow"|"deny"，默认 "ask"）；
+// 只读工具始终回退为 allow。Allow/Ask/Deny 是规则列表，格式为 "ToolName" 或
+// "ToolName(glob)"。优先级：deny > ask > allow > fallback。
 type PermissionsConfig struct {
-	Mode  string   `toml:"mode"`
-	Allow []string `toml:"allow"`
-	Ask   []string `toml:"ask"`
-	Deny  []string `toml:"deny"`
+	Mode  string   `toml:"mode"`  // 回退决策模式（"ask"|"allow"|"deny"）
+	Allow []string `toml:"allow"` // 允许规则列表
+	Ask   []string `toml:"ask"`   // 询问规则列表
+	Deny  []string `toml:"deny"`  // 拒绝规则列表
 }
 
-// PluginEntry declares an external MCP server. Type selects the transport:
-// "stdio" (default) launches Command/Args/Env as a subprocess; "http"
-// (a.k.a. streamable-http) and "sse" connect to a remote URL with optional
-// static Headers. String fields support ${VAR} / ${VAR:-default} expansion so
-// secrets (bearer tokens, keys) come from the environment, not the file. The
-// fields mirror Claude Code's mcpServers spec, so entries can come from either
-// reasonix.toml's [[plugins]] or a project-root .mcp.json (see loadMCPJSON).
+// PluginEntry 声明一个外部 MCP（Model Context Protocol）服务器。
+// Type 选择传输方式："stdio"（默认）将 Command/Args/Env 作为子进程启动；
+// "http"（又称 streamable-http）和 "sse" 连接到远程 URL（可选静态 Headers）。
+// 字符串字段支持 ${VAR} / ${VAR:-default} 扩展，使密钥（bearer tokens、keys）
+// 来自环境变量而非文件。字段镜像 Claude Code 的 mcpServers 规范，
+// 因此条目可以来自 reasonix.toml 的 [[plugins]] 或项目根目录的 .mcp.json。
 type PluginEntry struct {
-	Name    string            `toml:"name"`
-	Type    string            `toml:"type"` // "stdio" (default) | "http" | "sse"
-	Command string            `toml:"command"`
-	Args    []string          `toml:"args"`
-	Env     map[string]string `toml:"env"`
-	URL     string            `toml:"url"`
-	Headers map[string]string `toml:"headers"`
+	Name    string            `toml:"name"`    // 插件名称（用于标识和合并）
+	Type    string            `toml:"type"`    // 传输类型："stdio"（默认）|"http"|"sse"
+	Command string            `toml:"command"` // stdio 模式的启动命令
+	Args    []string          `toml:"args"`    // 命令参数
+	Env     map[string]string `toml:"env"`     // 环境变量
+	URL     string            `toml:"url"`     // http/sse 模式的远程 URL
+	Headers map[string]string `toml:"headers"` // http/sse 模式的请求头
 	// AutoStart controls whether the server connects during session startup.
 	// Nil preserves historical behavior: configured servers start automatically.
 	AutoStart *bool `toml:"auto_start"`
@@ -1072,13 +1173,18 @@ type PluginEntry struct {
 	Tier string `toml:"tier"`
 }
 
+// ShouldAutoStart 检查插件是否应自动启动。
+// 未设置 AutoStart（nil）时默认为 true。
+//
+// 返回值：true 表示应自动启动
 func (e PluginEntry) ShouldAutoStart() bool {
 	return e.AutoStart == nil || *e.AutoStart
 }
 
-// ResolvedTier returns the normalized tier ("eager"|"background") with the
-// project default applied. Legacy lazy and unknown values fall back to
-// background so enabled MCPs are available without manual connection.
+// ResolvedTier 返回规范化的层级（"eager"|"background"），应用项目默认值。
+// 旧版 lazy 和未知值回退到 background，使启用的 MCP 无需手动连接即可使用。
+//
+// 返回值：规范化后的层级字符串
 func (e PluginEntry) ResolvedTier() string {
 	return resolvedMCPTier(e.Tier)
 }
@@ -1096,6 +1202,10 @@ func resolvedMCPTier(tier string) string {
 	}
 }
 
+// AutoStartPlugins 返回配置为自动启动的插件列表。
+// 用于在会话启动时自动连接 MCP 服务器。
+//
+// 返回值：应自动启动的插件列表
 func (c *Config) AutoStartPlugins() []PluginEntry {
 	out := make([]PluginEntry, 0, len(c.Plugins))
 	for _, p := range c.Plugins {
@@ -1133,7 +1243,11 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 	`whenever they switch. Let this also guide the language you think in. Always keep code, ` +
 	`identifiers, file paths, shell commands, and technical terms in their original form — never translate them.`
 
-// Default returns the built-in default configuration.
+// Default 返回内置的默认配置。
+// 包含所有配置项的默认值，如默认模型（deepseek-flash）、
+// 系统提示、权限策略、沙箱设置等。
+//
+// 返回值：默认配置对象指针
 func Default() *Config {
 	return &Config{
 		ConfigVersion:    3,
@@ -1218,9 +1332,13 @@ func deepSeekV4PricesUSD() map[string]*provider.Pricing {
 	}
 }
 
-// DeepSeekV4PricesForLanguage keeps the settings/template call site stable while
-// official DeepSeek defaults move to RMB. Persisted prices still win; this is
-// only used for templates and missing-default backfills.
+// DeepSeekV4PricesForLanguage 保持设置/模板调用点稳定，而官方 DeepSeek 默认值
+// 移动到人民币。持久化的价格仍然优先；这仅用于模板和缺失默认值的回填。
+//
+// 参数：
+//   - lang: 语言（目前不影响返回值）
+//
+// 返回值：模型价格映射
 func DeepSeekV4PricesForLanguage(lang string) map[string]*provider.Pricing {
 	_ = lang
 	return deepSeekV4Prices()
@@ -1236,17 +1354,19 @@ func deepSeekV4PriceForModel(lang, model string) *provider.Pricing {
 	return clonePricing(deepSeekV4Prices()[strings.TrimSpace(model)])
 }
 
-// DeepSeekOfficialPricingLanguage is retained for settings/template compatibility.
-// Official DeepSeek providers now seed RMB prices by default; explicit user
-// prices in config still override these defaults.
+// DeepSeekOfficialPricingLanguage 保留用于设置/模板兼容性。
+// 官方 DeepSeek 提供者现在默认使用人民币价格；配置中的显式用户价格仍覆盖这些默认值。
+//
+// 返回值：价格语言标识（目前固定返回 "zh"）
 func (c *Config) DeepSeekOfficialPricingLanguage() string {
 	_ = c
 	return "zh"
 }
 
-// ApplyDeepSeekOfficialDefaultPricing refreshes built-in/official DeepSeek
-// prices that still match known official defaults. Custom user prices are left
-// untouched.
+// ApplyDeepSeekOfficialDefaultPricing 刷新仍匹配已知官方默认值的内置/官方 DeepSeek 价格。
+// 用户自定义价格不受影响。
+//
+// 参数：无（修改接收者 c）
 func (c *Config) ApplyDeepSeekOfficialDefaultPricing() {
 	applyDeepSeekOfficialDefaultPricing(c)
 }
@@ -1299,10 +1419,16 @@ func mimoDomesticPrices(models []string) map[string]*provider.Pricing {
 	return prices
 }
 
-// ResetOfficialProviderPricingOnUpgrade resets official DeepSeek prices to
-// the current built-in RMB defaults once for desktop upgrades. It intentionally
-// runs from the desktop app startup path, not every config Load(), so user edits
-// made after the upgrade are preserved.
+// ResetOfficialProviderPricingOnUpgrade 在桌面升级时将官方 DeepSeek 价格
+// 重置为当前内置的人民币默认值（仅执行一次）。故意从桌面应用启动路径运行，
+// 而非每次 config Load()，以保留升级后用户所做的编辑。
+//
+// 参数：
+//   - path: 配置文件路径
+//
+// 返回值：
+//   - bool: 是否执行了重置
+//   - error: 操作失败时返回错误
 func ResetOfficialProviderPricingOnUpgrade(path string) (bool, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -1386,19 +1512,37 @@ func samePricing(a, b *provider.Pricing) bool {
 	return a.CacheHit == b.CacheHit && a.Input == b.Input && a.Output == b.Output && a.Currency == b.Currency
 }
 
-// Load builds the configuration: defaults, then user config, then project
-// config, then MCP servers from Claude Code's .mcp.json, then (lowest priority)
-// the v0.x ~/.reasonix/config.json's mcpServers. A .env in the working directory
-// is loaded first so api_key_env can resolve.
+// Load 构建完整配置：按优先级合并多个配置源。
+//
+// 合并顺序（从低到高）：
+//  1. 内置默认值
+//  2. 用户级 config.toml（~/.reasonix/config.toml）
+//  3. 项目级 reasonix.toml（当前工作目录）
+//  4. Claude Code 的 .mcp.json（项目根目录）
+//  5. v0.x ~/.reasonix/config.json 的 mcpServers（最低优先级兼容层）
+//
+// 工作目录中的 .env 文件会首先加载，使 api_key_env 能正确解析。
+//
+// 返回值：
+//   - *Config: 合并后的配置对象
+//   - error: 加载失败时返回错误
 func Load() (*Config, error) {
 	return LoadForRoot(".")
 }
 
-// LoadForRoot builds the configuration with project files resolved from root
-// instead of the current working directory. When root is "" or ".", it behaves
-// like Load(). This is the workspace-aware entry point: desktop tabs use it so
-// each project's reasonix.toml + .env + .mcp.json are resolved independently
-// without changing the process cwd.
+// LoadForRoot 从指定根目录构建配置（而非当前工作目录）。
+// 当 root 为 "" 或 "." 时，行为与 Load() 相同。
+//
+// 这是工作区感知的入口点：桌面标签页使用它，
+// 使每个项目的 reasonix.toml + .env + .mcp.json 独立解析，
+// 无需更改进程的工作目录。
+//
+// 参数：
+//   - root: 项目根目录路径
+//
+// 返回值：
+//   - *Config: 合并后的配置对象
+//   - error: 加载失败时返回错误
 func LoadForRoot(root string) (*Config, error) {
 	root = resolveRoot(root)
 	loadDotEnvForRoot(root)
@@ -1709,11 +1853,15 @@ func mergeTOMLProviderAccess(paths []string) ([]string, bool, error) {
 	return merged, saw, nil
 }
 
-// LoadForEdit returns a config to seed the `reasonix setup` wizard when reconfiguring:
-// the built-in defaults with the file at path (if present) decoded on top, so a
-// reconfigure preserves the user's existing providers and agent settings instead
-// of resetting to defaults. .env is loaded so api_key_env resolution works while
-// the wizard decides which keys are still missing.
+// LoadForEdit 返回用于 `reasonix setup` 向导的配置。
+// 将内置默认值与指定路径的文件（如果存在）合并，使重新配置时
+// 保留用户现有的提供者和智能体设置，而不是重置为默认值。
+// 加载 .env 以便向导在决定哪些密钥缺失时能正确解析 api_key_env。
+//
+// 参数：
+//   - path: 配置文件路径
+//
+// 返回值：合并后的配置对象（加载失败时返回默认值）
 func LoadForEdit(path string) *Config {
 	cfg, err := loadForEditStrict(path, true)
 	if err == nil {
@@ -1726,6 +1874,8 @@ func LoadForEdit(path string) *Config {
 	return cfg
 }
 
+// LoadForEditWithoutCredentials 与 LoadForEdit 类似，但不加载凭证文件。
+// 用于不需要 API 密钥的编辑场景（如设置 UI）。
 func LoadForEditWithoutCredentials(path string) *Config {
 	cfg, err := loadForEditStrict(path, false)
 	if err == nil {
@@ -2041,9 +2191,14 @@ func normalizeLegacyMimoCustomProviders(c *Config) bool {
 	return normalizeLegacyMimoCustomProvidersForRefs(c, legacyMimoConfigRefs(c)...)
 }
 
-// NormalizeLegacyMimoCustomProvidersForRefs appends custom OpenAI-compatible
-// MiMo providers needed by legacy refs that live outside reasonix.toml, such as
-// restored desktop tab state.
+// NormalizeLegacyMimoCustomProvidersForRefs 追加旧版引用所需的自定义 OpenAI 兼容 MiMo 提供者，
+// 这些引用位于 reasonix.toml 之外（如恢复的桌面标签页状态）。
+//
+// 参数：
+//   - c: 配置对象（会被修改）
+//   - refs: 模型引用列表
+//
+// 返回值：true 表示配置被修改
 func NormalizeLegacyMimoCustomProvidersForRefs(c *Config, refs ...string) bool {
 	return normalizeLegacyMimoCustomProvidersForRefs(c, refs...)
 }
@@ -2196,10 +2351,12 @@ func normalizeDesktopOfficialProviderAccess(c *Config) {
 	retargetDesktopOfficialRefs(c, seen)
 }
 
-// NormalizeLegacyDesktopProviderAccess seeds the desktop provider-access list
-// for configs written before Settings tracked explicit provider access. Callers
-// should only use this when they know the TOML did not declare provider_access;
-// an explicit empty list means the user removed all access entries.
+// NormalizeLegacyDesktopProviderAccess 为 Settings 跟踪显式提供者访问之前
+// 编写的配置种子化桌面提供者访问列表。调用方应仅在确定 TOML 未声明
+// provider_access 时使用此函数；显式空列表表示用户移除了所有访问条目。
+//
+// 参数：
+//   - c: 配置对象（会被修改）
 func NormalizeLegacyDesktopProviderAccess(c *Config) {
 	if c == nil || len(c.Desktop.ProviderAccess) > 0 {
 		return
@@ -2289,8 +2446,13 @@ func providerEntryMatchesCanonicalOfficialAccess(p *ProviderEntry, canonical str
 	}
 }
 
-// CanonicalDesktopOfficialProviderName returns the Settings Center provider ID
-// for built-in official provider aliases.
+// CanonicalDesktopOfficialProviderName 返回内置官方提供者别名的 Settings Center 提供者 ID。
+// 例如 "deepseek-flash" → "deepseek"。
+//
+// 参数：
+//   - name: 提供者名称
+//
+// 返回值：规范化的提供者 ID
 func CanonicalDesktopOfficialProviderName(name string) string {
 	return canonicalDesktopOfficialProviderName(name)
 }
@@ -2642,10 +2804,11 @@ func userConfigDisplayPath() string {
 	return p
 }
 
-// UserConfigPath is the user-global config.toml. It lives under Reasonix home:
-// REASONIX_HOME/config.toml, then ~/.reasonix/config.toml on Unix-like systems,
-// or %AppData%/reasonix/config.toml on Windows. "" when the user config dir
-// can't be resolved.
+// UserConfigPath 返回用户全局 config.toml 的路径。
+// 位于 Reasonix 主目录下：REASONIX_HOME/config.toml，
+// Unix 系统上为 ~/.reasonix/config.toml，
+// Windows 上为 %AppData%/reasonix/config.toml。
+// 无法解析用户配置目录时返回空字符串。
 func UserConfigPath() string { return userConfigPath() }
 
 // LegacyUserConfigPath is the old OS app-support config.toml path when it
@@ -2676,17 +2839,18 @@ func LegacyUserConfigPaths() []string {
 	return out
 }
 
-// ReasonixHomeDir is the current Reasonix home directory. It honors
-// REASONIX_HOME, then uses ~/.reasonix on macOS/Linux or %APPDATA%/reasonix on
-// Windows.
+// ReasonixHomeDir 返回当前的 Reasonix 主目录。
+// 优先使用 REASONIX_HOME 环境变量，否则：
+//   - macOS/Linux: ~/.reasonix
+//   - Windows: %APPDATA%/reasonix
 func ReasonixHomeDir() string { return reasonixHomeDir() }
 
-// UserCredentialsPath is the reasonix-owned global secrets file under Reasonix
-// home. It holds KEY=value lines loaded into the environment by loadDotEnv. The
-// setup wizard writes API keys here, deliberately NOT named .env: keys never
-// land in a project's own .env (which can't be selectively gitignored), never
-// get committed, and resolve from any working directory. "" when Reasonix home
-// can't be resolved.
+// UserCredentialsPath 返回 Reasonix 全局凭证文件的路径。
+// 位于 Reasonix 主目录下，包含 KEY=value 行，由 loadDotEnv 加载到环境变量中。
+// 设置向导将 API 密钥写入此文件，故意不命名为 .env：
+// 密钥永远不会落入项目的 .env（无法选择性 gitignore），
+// 永远不会被提交，并且从任何工作目录都能解析。
+// 无法解析 Reasonix 主目录时返回空字符串。
 func UserCredentialsPath() string {
 	dir := userSupportDir()
 	if dir == "" {
@@ -2695,9 +2859,8 @@ func UserCredentialsPath() string {
 	return filepath.Join(dir, "credentials")
 }
 
-// ArchiveDir is where compacted conversation history is archived for
-// traceability (one timestamped .jsonl per compaction). Empty if the user state
-// directory cannot be resolved, in which case archiving is skipped.
+// ArchiveDir 返回压缩对话历史的归档目录（每次压缩一个带时间戳的 .jsonl 文件）。
+// 用于可追溯性。无法解析用户状态目录时返回空字符串，此时跳过归档。
 func ArchiveDir() string {
 	dir := userSupportDir()
 	if dir == "" {
@@ -2706,9 +2869,9 @@ func ArchiveDir() string {
 	return filepath.Join(dir, "archive")
 }
 
-// SessionDir is where chat sessions are persisted (one .jsonl per session).
-// Used by `reasonix --continue` / `--resume` to find the recent ones. Empty
-// if the user state dir can't be resolved — sessions then aren't saved.
+// SessionDir 返回聊天会话的持久化目录（每个会话一个 .jsonl 文件）。
+// 由 `reasonix --continue` / `--resume` 用于查找最近的会话。
+// 无法解析用户状态目录时返回空字符串——此时会话不会被保存。
 func SessionDir() string {
 	dir := userSupportDir()
 	if dir == "" {
@@ -2732,15 +2895,20 @@ func ProjectSessionDir(workspaceRoot string) string {
 	return filepath.Join(base, "projects", WorkspaceSlug(root), "sessions")
 }
 
-// WorkspaceSlug flattens an absolute workspace path into the directory name
-// used under <config root>/projects.
+// WorkspaceSlug 将绝对工作区路径扁平化为 <config root>/projects 下使用的目录名。
+// 路径分隔符和特殊字符被替换为连字符。
+//
+// 参数：
+//   - absPath: 绝对工作区路径
+//
+// 返回值：扁平化的目录名
 func WorkspaceSlug(absPath string) string {
 	return strings.NewReplacer(string(os.PathSeparator), "-", "/", "-", "\\", "-", ":", "-").Replace(absPath)
 }
 
-// CacheDir is the per-user cache root for derived/regenerable artefacts: MCP
-// handshake snapshots, plugin startup-latency telemetry. Empty when the OS dir is
-// unavailable — callers must tolerate that (caching is best-effort).
+// CacheDir 返回每用户的缓存根目录，用于可重新生成的产物：
+// MCP 握手快照、插件启动延迟遥测等。OS 目录不可用时返回空字符串——
+// 调用方必须容忍这种情况（缓存是尽力而为的）。
 func CacheDir() string {
 	dir := userCacheDir()
 	if dir == "" {
@@ -2749,20 +2917,20 @@ func CacheDir() string {
 	return dir
 }
 
-// MemoryUserDir returns the reasonix user state root (…/reasonix), under which
-// the user-global REASONIX.md and the per-project auto-memory store live. Empty
-// when the user state dir can't be resolved, which disables user-scoped memory.
+// MemoryUserDir 返回 Reasonix 用户状态根目录（…/reasonix），
+// 用户全局 REASONIX.md 和每项目的自动记忆存储都在此目录下。
+// 无法解析用户状态目录时返回空字符串，此时禁用用户范围的记忆功能。
 func MemoryUserDir() string {
 	return userSupportDir()
 }
 
-// ConventionDirs are the parent directories scanned for agent assets (skills,
-// commands), in canonical-first order. .reasonix is ours; .agents / .agent /
-// .claude let users drop in assets authored for other agent tools without moving
-// files. Shared so skills (internal/skill) and commands (CommandDirs) discover
-// the same set. Note: hooks are NOT scanned across these — a .claude/settings.json
-// uses a different hook schema that can't be parsed as ours, so hooks stay in
-// .reasonix/settings.json (see internal/hook).
+// ConventionDirs 是扫描智能体资产（技能、命令）的父目录列表，按规范优先顺序排列。
+// .reasonix 是我们的目录；.agents / .agent / .claude 让用户可以直接放入
+// 为其他智能体工具编写的资产，无需移动文件。技能（internal/skill）和命令（CommandDirs）
+// 共享此列表以发现相同的目录集。
+//
+// 注意：钩子（hooks）不在这些目录中扫描——.claude/settings.json 使用不同的钩子架构，
+// 无法解析为我们的格式，因此钩子保留在 .reasonix/settings.json 中（见 internal/hook）。
 var ConventionDirs = []string{".reasonix", ".agents", ".agent", ".claude"}
 
 // conventionSubdirsAsc joins sub under each ConventionDir of base, in ascending
@@ -2776,14 +2944,17 @@ func conventionSubdirsAsc(base, sub string) []string {
 	return out
 }
 
-// CommandDirs returns the directories scanned for custom slash commands, lowest
-// priority first, so a later (more specific) directory overrides an earlier one
-// on a name clash. Order: home-dir convention dirs (~/.claude/commands …
-// ~/.reasonix/commands), the Reasonix home commands dir, the legacy OS
-// app-support dir if different, then the project's
-// convention dirs (.claude/commands … .reasonix/commands). Scanning the .claude /
-// .agents / .agent dirs lets commands authored for other agent tools (same .md +
-// frontmatter format) work here unchanged.
+// CommandDirs 返回扫描自定义斜杠命令的目录列表，最低优先级在前，
+// 使后面的（更具体的）目录在名称冲突时覆盖前面的。
+//
+// 扫描顺序：
+//  1. 主目录约定目录（~/.claude/commands ... ~/.reasonix/commands）
+//  2. Reasonix 主目录的 commands 目录
+//  3. 旧版 OS 应用支持目录（如果不同）
+//  4. 项目的约定目录（.claude/commands ... .reasonix/commands）
+//
+// 扫描 .claude / .agents / .agent 目录使为其他智能体工具编写的命令
+// （相同的 .md + frontmatter 格式）可以在此 unchanged 使用。
 func CommandDirs() []string {
 	return CommandDirsForRoot(".")
 }
@@ -2828,7 +2999,8 @@ func CommandDirsForRoot(root string) []string {
 	return dirs
 }
 
-// SourcePath returns the highest-priority config file that exists, or "" if none.
+// SourcePath 返回存在的最高优先级配置文件路径，不存在则返回空字符串。
+// 优先级：项目级 reasonix.toml > 用户级 config.toml。
 func SourcePath() string {
 	return SourcePathForRoot(".")
 }
@@ -2852,15 +3024,26 @@ func SourcePathForRoot(root string) string {
 	return ""
 }
 
-// WriteFile writes the configuration to path as annotated TOML. The write is
-// atomic + fsynced so an interrupted write or power loss can never truncate the
-// main config into an unparseable state that leaves the app with no usable
-// models (#4615, #4708).
+// WriteFile 将配置以带注释的 TOML 格式写入指定路径。
+// 写入是原子性的（atomic + fsync），确保中断的写入或断电
+// 永远不会将主配置截断为无法解析的状态（避免应用无可用模型）。
+//
+// 参数：
+//   - path: 写入路径
+//
+// 返回值：写入失败时返回错误
 func (c *Config) WriteFile(path string) error {
 	return fileutil.AtomicWriteFile(path, []byte(RenderTOMLForScope(c, renderScopeForPath(path))), configFilePerm(path))
 }
 
-// Provider returns the named provider entry.
+// Provider 根据名称查找提供者条目。
+//
+// 参数：
+//   - name: 提供者名称（如 "deepseek"）
+//
+// 返回值：
+//   - *ProviderEntry: 找到的提供者条目指针
+//   - bool: 是否找到
 func (c *Config) Provider(name string) (*ProviderEntry, bool) {
 	for i := range c.Providers {
 		if c.Providers[i].Name == name {
@@ -2870,16 +3053,24 @@ func (c *Config) Provider(name string) (*ProviderEntry, bool) {
 	return nil, false
 }
 
-// ResolveModel resolves a model reference to a provider entry whose Model is the
-// selected model string (a copy, so the config's lists stay intact). It accepts:
-//   - "provider/model" — that exact model under that provider;
-//   - a provider name   — the provider's default model;
-//   - a bare model name — the (first) provider that lists it.
+// ResolveModel 将模型引用解析为提供者条目（Model 字段为选中的模型字符串）。
+// 返回的是副本，配置的列表保持不变。
 //
-// The returned entry is ready to build a provider from (NewProvider reads .Model),
-// so a single "vendor with many models" entry yields one instance per model
-// without duplicating base_url/api_key_env. Single-`model` entries still resolve
-// by provider name, keeping older configs working unchanged.
+// 支持的引用格式：
+//   - "provider/model" — 该提供者下的指定模型（如 "deepseek/deepseek-v4-flash"）
+//   - 提供者名称 — 该提供者的默认模型（如 "deepseek"）
+//   - 裸模型名称 — 列出该模型的第一个提供者（如 "deepseek-v4-flash"）
+//
+// 返回的条目可直接用于构建提供者（NewProvider 读取 .Model），
+// 因此单个"多模型供应商"条目可以为每个模型生成一个实例，
+// 无需复制 base_url/api_key_env。
+//
+// 参数：
+//   - ref: 模型引用字符串
+//
+// 返回值：
+//   - *ProviderEntry: 解析后的提供者条目（Model 已设置为目标模型）
+//   - bool: 是否成功解析
 func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 	if ref == "" {
 		return nil, false
@@ -2915,10 +3106,17 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 	return nil, false
 }
 
-// ResolveModelWithFallback resolves a model reference to the canonical
-// "provider/model" form used by the desktop runtime. If ref is stale or empty,
-// it tries the user's configured default_model before falling back to the first
-// configured provider — so preference isn't overwritten by iteration order.
+// ResolveModelWithFallback 将模型引用解析为桌面运行时使用的规范 "provider/model" 形式。
+// 如果引用过期或为空，先尝试用户配置的 default_model，
+// 再回退到第一个已配置的提供者——确保用户偏好不被迭代顺序覆盖。
+//
+// 参数：
+//   - ref: 模型引用字符串
+//
+// 返回值：
+//   - resolvedRef: 解析后的规范引用（如 "deepseek/deepseek-v4-flash"）
+//   - fallback: 是否使用了回退（即 ref 本身解析失败）
+//   - ok: 是否成功解析
 func (c *Config) ResolveModelWithFallback(ref string) (resolvedRef string, fallback bool, ok bool) {
 	ref = strings.TrimSpace(ref)
 	if ref != "" {
@@ -2948,7 +3146,9 @@ func (c *Config) ResolveModelWithFallback(ref string) (resolvedRef string, fallb
 	return "", false, false
 }
 
-// APIKey resolves the entry's API key from its api_key_env.
+// APIKey 从 api_key_env 环境变量解析提供者的 API 密钥。
+//
+// 返回值：API 密钥字符串（未设置则返回空字符串）
 func (e *ProviderEntry) APIKey() string {
 	if e.APIKeyEnv == "" {
 		return ""
@@ -2956,11 +3156,11 @@ func (e *ProviderEntry) APIKey() string {
 	return os.Getenv(e.APIKeyEnv)
 }
 
-// RequiresAPIKey reports whether this provider should be hidden/validated when
-// its configured api_key_env is empty. A blank api_key_env means the provider is
-// intentionally no-auth. Local OpenAI-compatible gateways often keep a legacy
-// api_key_env in config even though they accept unauthenticated requests, so
-// loopback/private endpoints are also allowed to run without a resolved key.
+// RequiresAPIKey 检查此提供者是否需要 API 密钥。
+// 空的 api_key_env 表示提供者故意不需要认证（如本地网关）。
+// 回环/私有端点也允许在没有解析到密钥的情况下运行。
+//
+// 返回值：true 表示需要 API 密钥
 func (e *ProviderEntry) RequiresAPIKey() bool {
 	if e == nil {
 		return false
@@ -2996,21 +3196,36 @@ func providerBaseURLAllowsMissingAPIKey(raw string) bool {
 	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast()
 }
 
-// Configured reports whether the provider is selectable. Providers that do not
-// require an API key are configured by definition; providers that name an env var
-// require that variable to resolve unless their endpoint is local/private.
+// Configured 检查提供者是否可选（即已正确配置）。
+// 不需要 API 密钥的提供者天然已配置；需要密钥的提供者要求环境变量已设置，
+// 除非端点是本地/私有的。
+//
+// 返回值：true 表示提供者已配置可用
 func (e *ProviderEntry) Configured() bool {
 	return e != nil && (!e.RequiresAPIKey() || e.APIKey() != "")
 }
 
-// ResolveSystemPrompt returns the system prompt, reading system_prompt_file if set.
+// ResolveSystemPrompt 返回系统提示文本。
+// 如果设置了 system_prompt_file，则从文件读取；否则使用配置中的 system_prompt。
+// 两者都为空时返回 DefaultSystemPrompt。
+//
+// 返回值：
+//   - string: 系统提示文本
+//   - error: 文件读取失败时返回错误
 func (c *Config) ResolveSystemPrompt() (string, error) {
 	return c.ResolveSystemPromptForRoot(".")
 }
 
-// ResolveSystemPromptForRoot is like ResolveSystemPrompt but resolves a relative
-// system_prompt_file against root. Desktop tabs pass their workspace root here so
-// prompt files are project-scoped even when the process cwd is elsewhere.
+// ResolveSystemPromptForRoot 与 ResolveSystemPrompt 类似，但将相对的
+// system_prompt_file 解析为相对于 root 的路径。桌面标签页在此传入其工作区根目录，
+// 使提示文件按项目范围解析，即使进程 cwd 在其他地方。
+//
+// 参数：
+//   - root: 项目根目录
+//
+// 返回值：
+//   - string: 系统提示文本
+//   - error: 文件读取失败时返回错误
 func (c *Config) ResolveSystemPromptForRoot(root string) (string, error) {
 	if c.Agent.SystemPromptFile != "" {
 		path := c.Agent.SystemPromptFile
@@ -3029,7 +3244,13 @@ func (c *Config) ResolveSystemPromptForRoot(root string) (string, error) {
 	return c.Agent.SystemPrompt, nil
 }
 
-// Validate checks that the selected model's provider is usable.
+// Validate 检查所选模型的提供者是否可用。
+// 验证内容：模型是否存在、kind 和 base_url 是否已设置、API 密钥是否已配置。
+//
+// 参数：
+//   - model: 模型引用字符串
+//
+// 返回值：验证失败时返回描述性错误
 func (c *Config) Validate(model string) error {
 	e, ok := c.ResolveModel(model)
 	if !ok {

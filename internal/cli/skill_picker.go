@@ -1,3 +1,6 @@
+// skill_picker.go 实现了 TUI 中 /skills manage 的交互式技能选择器。
+// 支持多视图模式（技能列表、来源列表、来源内技能、详情、确认删除），
+// 提供搜索过滤、启用/禁用切换、删除、重新扫描等功能。
 package cli
 
 import (
@@ -13,6 +16,7 @@ import (
 	"reasonix/internal/skill"
 )
 
+// scopePriority 定义技能作用域的排序优先级：项目 > 自定义 > 全局 > 内置。
 var scopePriority = map[skill.Scope]int{
 	skill.ScopeProject: 0,
 	skill.ScopeCustom:  1,
@@ -20,16 +24,20 @@ var scopePriority = map[skill.Scope]int{
 	skill.ScopeBuiltin: 3,
 }
 
+// skillPickerMode 表示技能选择器的当前视图模式。
 type skillPickerMode string
 
+// 技能选择器的视图模式常量。
 const (
-	pickerSkills        skillPickerMode = "skills"
-	pickerSources       skillPickerMode = "sources"
-	pickerSourceSkills  skillPickerMode = "source-skills"
-	pickerDetail        skillPickerMode = "detail"
-	pickerConfirmDelete skillPickerMode = "confirm-delete"
+	pickerSkills        skillPickerMode = "skills"         // 技能列表视图
+	pickerSources       skillPickerMode = "sources"        // 来源目录列表视图
+	pickerSourceSkills  skillPickerMode = "source-skills"  // 某来源下的技能列表视图
+	pickerDetail        skillPickerMode = "detail"         // 技能详情视图
+	pickerConfirmDelete skillPickerMode = "confirm-delete" // 删除确认视图
 )
 
+// skillPicker 是技能选择器的状态结构体，管理所有视图模式下的导航、搜索、
+// 启用/禁用状态和操作确认。
 type skillPicker struct {
 	mode            skillPickerMode
 	skills          []skill.Skill
@@ -49,6 +57,7 @@ type skillPicker struct {
 	deleteSkill     skill.Skill
 }
 
+// skillRootLine 表示技能来源目录列表中的一行，包含路径、作用域、状态和技能计数。
 type skillRootLine struct {
 	dir        string
 	scope      skill.Scope
@@ -58,6 +67,8 @@ type skillRootLine struct {
 	diagnostic bool
 }
 
+// openSkillPicker 打开技能选择器，加载所有技能并初始化启用/禁用状态映射。
+// 当没有技能时显示通知并返回。
 func (m *chatTUI) openSkillPicker() {
 	st := m.skillStore()
 	skills := st.List()
@@ -86,6 +97,8 @@ func (m *chatTUI) openSkillPicker() {
 	}
 }
 
+// handleSkillPickerKey 处理技能选择器的按键路由，根据当前模式分发到对应的处理函数。
+// 搜索模式下优先处理搜索相关的按键（输入、退格、导航、确认、取消）。
 func (m chatTUI) handleSkillPickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	p := m.skillPick
 	if p == nil {
@@ -285,6 +298,8 @@ func (m chatTUI) handleSkillPickerConfirmDeleteKey(msg tea.KeyPressMsg) (tea.Mod
 	return m, nil
 }
 
+// saveSkillPick 保存技能选择器的变更：收集启用/禁用状态的变化，
+// 关闭选择器，持久化变更，并安排会话刷新。
 func (m chatTUI) saveSkillPick() (tea.Model, tea.Cmd) {
 	p := m.skillPick
 	if p == nil {
@@ -303,6 +318,8 @@ func (m chatTUI) saveSkillPick() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// deleteSkillPick 执行技能删除操作：删除技能文件，更新选择器状态，
+// 并安排会话刷新。内置技能不可删除。
 func (m chatTUI) deleteSkillPick(sk skill.Skill) (tea.Model, tea.Cmd) {
 	p := m.skillPick
 	target, ok, err := skillDeleteTarget(sk)
@@ -339,11 +356,14 @@ func (m chatTUI) deleteSkillPick(sk skill.Skill) (tea.Model, tea.Cmd) {
 	return m, m.pendingModelSwitch
 }
 
+// rescanSkills 重新扫描技能目录并刷新选择器数据。
 func (m *chatTUI) rescanSkills() {
 	m.refreshSkillPickerData()
 	m.notice(i18n.M.SkillPickerRescanned)
 }
 
+// refreshSkillPickerData 刷新技能选择器的所有数据：重新加载技能列表、来源信息，
+// 同步启用/禁用状态映射，并修正选择索引以防止越界。
 func (m *chatTUI) refreshSkillPickerData() {
 	st := m.skillStore()
 	skills := st.List()
@@ -649,6 +669,7 @@ func skillDeleteTargetLabel(s skill.Skill) string {
 	return target
 }
 
+// sortedSkills 按作用域优先级（项目 > 自定义 > 全局 > 内置）和名称排序技能列表。
 func sortedSkills(skills []skill.Skill) []skill.Skill {
 	sorted := make([]skill.Skill, len(skills))
 	copy(sorted, skills)
@@ -663,6 +684,7 @@ func sortedSkills(skills []skill.Skill) []skill.Skill {
 	return sorted
 }
 
+// clampSel 将选择索引限制在有效范围内（0 到 len(items)-1），支持泛型。
 func clampSel[T any](sel int, items []T) int {
 	if len(items) == 0 {
 		return 0
@@ -676,6 +698,7 @@ func clampSel[T any](sel int, items []T) int {
 	return sel
 }
 
+// clampInt 将整数索引限制在 0 到 total-1 的范围内。
 func clampInt(sel, total int) int {
 	if total <= 0 {
 		return 0

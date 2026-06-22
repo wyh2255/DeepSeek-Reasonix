@@ -1,3 +1,6 @@
+// transcript.go 实现了会话转录（transcript）视图的渲染与交互功能。
+// 包括：文本自动换行（保持 SGR 样式平衡）、剪贴板复制（平台工具 + OSC 52 回退）、
+// 鼠标拖拽选择文本、边缘自动滚动、滚动条渲染，以及屏幕坐标到内容位置的映射。
 package cli
 
 import (
@@ -22,8 +25,8 @@ func wrapTranscript(s string, width int) string {
 	return lipgloss.NewStyle().Width(width).Render(s)
 }
 
-// clipboardWriteAll is the platform clipboard writer; a var so tests can force
-// the failure path (the tmux / SSH scenario) without a real display server.
+// clipboardWriteAll 是平台剪贴板写入函数的可替换变量。
+// 声明为变量而非直接调用，以便测试中模拟失败场景（如 tmux/SSH 无显示服务器）。
 var clipboardWriteAll = clipboard.WriteAll
 
 // copyToClipboard writes text to the system clipboard. It first tries the
@@ -42,16 +45,17 @@ func copyToClipboard(text string) tea.Cmd {
 	}
 }
 
-// autoScrollMsg drives one step of edge-drag scrolling while a selection is held
-// against the top or bottom of the transcript.
+// autoScrollMsg 是驱动边缘拖拽自动滚动的消息类型。
+// 当选择操作到达视口顶部或底部边缘时，定时触发此消息以持续滚动。
 type autoScrollMsg struct{}
 
+// autoScrollTick 创建一个定时触发的自动滚动命令，每 80ms 触发一次。
 func autoScrollTick() tea.Cmd {
 	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return autoScrollMsg{} })
 }
 
-// edgeScrollDir reports the auto-scroll direction for a drag at screen row y in
-// a viewport of `height` rows: -1 at the top edge, +1 at the bottom, 0 between.
+// edgeScrollDir 判断拖拽位置相对于视口的自动滚动方向：
+// 在顶部边缘返回 -1（向上滚动），底部边缘返回 +1（向下滚动），中间返回 0。
 func edgeScrollDir(y, height int) int {
 	switch {
 	case y <= 0:
@@ -63,18 +67,19 @@ func edgeScrollDir(y, height int) int {
 	}
 }
 
-// selPos is a caret position in the wrapped transcript: a content-line index
-// (absolute, scroll-independent) and a visual column.
+// selPos 表示自动换行后转录文本中的光标位置。
+// line 是绝对内容行索引（与滚动无关），col 是可视列位置。
 type selPos struct{ line, col int }
 
-// selection is the live left-drag text selection over the transcript. anchor is
-// where the drag began, head where it currently is; active gates rendering and
-// copy. Coordinates are absolute content lines so scrolling never moves them.
+// selection 表示转录文本上的鼠标拖拽选择状态。
+// anchor 是拖拽起始点，head 是当前拖拽位置；active 控制选择的渲染和复制。
+// 坐标使用绝对内容行，因此滚动不会影响选择位置。
 type selection struct {
 	active       bool
 	anchor, head selPos
 }
 
+// ordered 返回选择区域按文档顺序排列的起止位置（start 在前，end 在后）。
 func (s selection) ordered() (start, end selPos) {
 	if s.anchor.line > s.head.line || (s.anchor.line == s.head.line && s.anchor.col > s.head.col) {
 		return s.head, s.anchor
@@ -82,8 +87,10 @@ func (s selection) ordered() (start, end selPos) {
 	return s.anchor, s.head
 }
 
+// empty 判断选择区域是否为空（锚点和头部在同一位置）。
 func (s selection) empty() bool { return s.anchor == s.head }
 
+// selStyle 是选中文本的反色高亮样式。
 var (
 	selStyle         = lipgloss.NewStyle().Reverse(true)
 	scrollThumbStyle lipgloss.Style
@@ -151,6 +158,7 @@ func selSpan(idx int, start, end selPos, cw int) (lo, hi int, ok bool) {
 
 // selectedText is the plain (ANSI-stripped) text of the active selection, lines
 // joined with '\n', for the clipboard.
+// selectedText 提取当前选择区域的纯文本内容（去除 ANSI 转义序列），用于复制到剪贴板。
 func (m chatTUI) selectedText() string {
 	if !m.sel.active || m.sel.empty() {
 		return ""
@@ -189,6 +197,7 @@ func scrollbarThumb(height, yoff, total int) (start, size int) {
 	return start, size
 }
 
+// scrollbarCell 返回单行滚动条的渲染字符：滑块位置显示 "█"，轨道位置显示 "│"。
 func scrollbarCell(row, total, height, thumbStart, thumbSize int) string {
 	if total <= height {
 		return " "

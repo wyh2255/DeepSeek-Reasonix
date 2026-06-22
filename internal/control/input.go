@@ -1,3 +1,12 @@
+// 文件：input.go
+//
+// 输入组合与预处理——计划模式标记、目标块、记忆注入、推理语言、合成消息检测。
+// 本文件负责将用户原始输入转换为适合发送给模型的组合文本。
+// Compose 方法是核心入口，它依次注入：计划模式标记、活动目标块、推理语言偏好、
+// 记忆更新注释、后台作业完成通知。
+//
+// 同时包含目标命令解析（/goal）、记忆快捷方式（# note、/remember）、
+// 自定义命令解析（CustomCommand、RunSkill、MCPPrompt）和 AutoResearch 协议逻辑。
 package control
 
 import (
@@ -9,9 +18,10 @@ import (
 	"reasonix/internal/skill"
 )
 
-// PlanModeMarker is prepended to every user turn while plan mode is on. It rides
-// in the user message (not the system prompt or tools), so the cache-stable
-// prompt prefix is left untouched and the toggle costs nothing in cache hits.
+// PlanModeMarker 在计划模式开启时添加到每个用户轮次的前面。
+// 它骑在用户消息中（不是系统提示或工具中），因此缓存稳定的提示前缀
+// 保持不变，切换在缓存命中方面零成本。
+// 标记文本指示模型进入只读研究模式，探索代码库后提出分层计划。
 const PlanModeMarker = "[Plan mode — read-only. Explore the codebase first (read_file, ls, grep, glob, web_fetch, task, ask are available; writers are refused by the harness). Before planning, if a decision that is genuinely the user's — tech stack, an ambiguous requirement, scope, an irreversible choice — would materially shape the plan and you can't settle it from the codebase or a sensible default, use the ask tool to clarify it first; otherwise pick the obvious default and state the assumption in the plan instead of asking. Then present a LAYERED plan as your reply and stop — do not write files, edit, or run side-effecting bash. Structure the plan as a two-level markdown list so it becomes a layered task list: each PHASE is a top-level numbered list item (a coherent milestone, e.g. \"1. Add the config loader\"), and each phase's concrete, verifiable sub-steps are bullets indented beneath it (e.g. \"   - parse the TOML into Config\"). Use plain numbered list items for phases — do NOT write phases as markdown headings (##, ###) — so both levels parse. Keep phases few (about 2-6). The user will be asked to approve before any changes are made.]"
 
 const (
@@ -19,19 +29,22 @@ const (
 	activeGoalClose = "</active-goal>"
 )
 
+// 目标状态常量——定义目标 FSM 的四种状态。
 const (
-	GoalStatusRunning  = "running"
-	GoalStatusComplete = "complete"
-	GoalStatusBlocked  = "blocked"
-	GoalStatusStopped  = "stopped"
+	GoalStatusRunning  = "running"  // 目标正在执行中
+	GoalStatusComplete = "complete" // 目标已完成
+	GoalStatusBlocked  = "blocked"  // 目标被阻塞（连续三次相同阻塞原因）
+	GoalStatusStopped  = "stopped"  // 目标已停止（用户取消或超时）
 )
 
+// GoalResearchMode 控制目标是否使用 AutoResearch 协议（持久化研究状态到
+// .reasonix/autoresearch/ 目录）。
 type GoalResearchMode int
 
 const (
-	GoalResearchAuto GoalResearchMode = iota
-	GoalResearchOn
-	GoalResearchOff
+	GoalResearchAuto GoalResearchMode = iota // 自动判断（基于目标文本的关键词匹配）
+	GoalResearchOn                           // 强制开启 AutoResearch
+	GoalResearchOff                          // 强制关闭 AutoResearch
 )
 
 // StripComposePrefixes removes controller-injected prefixes from a composed

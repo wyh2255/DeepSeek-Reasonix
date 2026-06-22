@@ -9,31 +9,37 @@ import (
 	"reasonix/internal/tool"
 )
 
-// Workspace builds a built-in tool set bound to a working directory, so several
-// agents can run concurrently with independent path roots — a desktop front-end
-// opening one tab per project, say. The process working directory is global and
-// cannot be made per-agent (os.Chdir is process-wide), so each tool instead
-// resolves relative paths against this directory and bash runs in it.
+// Workspace 构建绑定到工作目录的内置工具集，使多个 Agent 可以并发运行，
+// 各自拥有独立的路径根 — 例如桌面前端为每个项目打开一个标签页。
 //
-// Dir is that directory (empty yields process-cwd tools, byte-identical to the
-// compile-time built-ins). WriteRoots confines the file-writers (as
-// ConfineWriters); when empty and Dir is set, Dir itself becomes the sole write
-// root, so writes stay inside the project by default. Bash is the OS-sandbox
-// spec for the bash tool (as ConfineBash).
+// 进程工作目录是全局的，无法按 Agent 独立设置（os.Chdir 是进程级别的），
+// 因此每个工具改为基于此目录解析相对路径，bash 也在此目录中运行。
+//
+// 字段说明：
+//   - Dir: 工作目录（空值产生与编译时内置工具完全相同的进程 cwd 工具）
+//   - WriteRoots: 文件写入工具的限制目录（见 ConfineWriters）；
+//     空且 Dir 非空时，Dir 本身成为唯一的写入根
+//   - Bash: bash 工具的 OS 沙箱规范（见 ConfineBash）
+//   - BashTimeout: bash 前台命令的超时时间
+//   - Search: grep 搜索引擎配置（ripgrep 或原生 Go 扫描器）
+//   - ProxySpec: web_fetch 的代理设置
 type Workspace struct {
-	Dir         string
-	WriteRoots  []string
-	Bash        sandbox.Spec
-	BashTimeout time.Duration
-	Search      SearchSpec
-	ProxySpec   netclient.ProxySpec
+	Dir         string              // 工作目录
+	WriteRoots  []string            // 文件写入限制目录
+	Bash        sandbox.Spec        // bash OS 沙箱规范
+	BashTimeout time.Duration       // bash 前台命令超时
+	Search      SearchSpec          // grep 搜索引擎配置
+	ProxySpec   netclient.ProxySpec // web_fetch 代理设置
 }
 
-// Tools returns the built-in tools bound to the workspace, ready to Add to a
-// per-run tool.Registry. An empty enabled list yields every built-in; otherwise
-// only the named ones are returned (unknown names are ignored). This is the
-// per-workspace analogue of the cli's process-cwd assembly — a desktop driver
-// calls it once per agent instead of relying on the global working directory.
+// Tools 返回绑定到工作区的内置工具集，可直接添加到每次运行的 tool.Registry。
+//
+// 参数：
+//   - enabled: 要启用的工具名称列表。为空时返回所有内置工具；
+//     非空时只返回指定名称的工具（未知名称被忽略）
+//
+// 这是 CLI 进程 cwd 组装的工作区版本 — 桌面驱动为每个 Agent 调用一次，
+// 而非依赖全局工作目录。
 func (w Workspace) Tools(enabled ...string) []tool.Tool {
 	writeRoots := w.WriteRoots
 	if len(writeRoots) == 0 && w.Dir != "" {
@@ -82,13 +88,13 @@ func (w Workspace) Tools(enabled ...string) []tool.Tool {
 	return out
 }
 
-// resolveIn maps a tool's path/pattern argument into a working directory. With
-// an empty workDir it returns p unchanged — the process-cwd behavior the
-// compile-time built-ins have always had, so existing callers are unaffected.
-// Otherwise a relative p is joined onto workDir; an absolute p is returned as-is
-// (an explicit absolute path is honored verbatim — the write-confiner, not this,
-// enforces the workspace boundary). An empty p resolves to workDir itself, so a
-// defaulted "." (ls/grep) targets the workspace root.
+// resolveIn 将工具的路径/模式参数映射到工作目录。
+//
+// 规则：
+//   - workDir 为空：返回 p 不变（编译时内置工具的进程 cwd 行为）
+//   - p 为空或 "."：返回 workDir 本身（ls/grep 的默认 "." 指向工作区根）
+//   - p 是绝对路径：原样返回（显式绝对路径被尊重 — 工作区边界由 write-confiner 强制）
+//   - p 是相对路径：与 workDir 拼接
 func resolveIn(workDir, p string) string {
 	if workDir == "" {
 		return p

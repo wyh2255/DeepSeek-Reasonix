@@ -1,3 +1,9 @@
+// 文件：shell_kill_windows.go
+//
+// Windows 平台的 shell 进程树终止实现。
+// Windows 不会将 kill 级联到子进程，因此杀死 shell 后生成的命令仍在运行；
+// taskkill /T 遍历 PID 树，/F 强制终止。同时隐藏子进程的控制台窗口。
+
 //go:build windows
 
 package control

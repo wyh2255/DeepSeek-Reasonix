@@ -1,3 +1,13 @@
+// 文件：approval.go
+//
+// 审批管理器——工具审批和用户提问的簿记与运行时姿态管理。
+// approvalManager 拥有审批/提示的簿记和运行时审批姿态（ask/auto/yolo），
+// 使用自己的锁（不依赖 c.mu）。它是一个严格的叶子：其方法仅触及自身状态，
+// 永远不会回调 Controller。
+//
+// Controller 保留了 I/O 编排（发出事件、触发钩子、重建执行器门控），
+// 这些需要其他协作者——approval 与目标 FSM 不同，它阻塞在用户输入上并有副作用，
+// 因此只提取了簿记部分，而非编排部分。
 package control
 
 import (
@@ -12,45 +22,40 @@ import (
 	"reasonix/internal/permission"
 )
 
-// approvalManager owns the approval/ask prompt bookkeeping and the runtime
-// approval posture, behind its own locks and off the controller's c.mu. It is a
-// strict leaf: its methods only touch its own state and never call back into the
-// Controller. The Controller keeps the I/O orchestration (emitting events,
-// firing hooks, rebuilding the executor gate) that needs its other collaborators
-// — approval, unlike the goal FSM, blocks on user input and has side effects, so
-// only the bookkeeping is extracted, not the orchestration.
+// approvalManager 拥有审批/提问提示的簿记和运行时审批姿态（ask/auto/yolo），
+// 使用自己的锁（不依赖 c.mu）。它是一个严格的叶子：其方法仅触及自身状态，
+// 永远不会回调 Controller。Controller 保留了 I/O 编排（发出事件、触发钩子、
+// 重建执行器门控）——审批与目标 FSM 不同，它阻塞在用户输入上并有副作用，
+// 因此只提取了簿记部分，而非编排部分。
 type approvalManager struct {
-	// policy is the immutable base permission policy, captured at construction.
-	// Used to decide whether a tool call would auto-approve under the writer
-	// fallback (autoApprovalWouldAllowLocked); the Controller keeps its own copy
-	// for building the executor gate.
+	// policy 是不可变的基础权限策略，在构造时捕获。
+	// 用于判断工具调用是否会在写入回退模式下自动批准（autoApprovalWouldAllowLocked）；
+	// Controller 保留自己的副本用于构建执行器门控。
 	policy permission.Policy
 
-	// mu guards the prompt maps and posture fields; every critical section under
-	// it is short and non-blocking.
+	// mu 保护提示映射和姿态字段；每个临界区尽量短且非阻塞。
 	mu        sync.Mutex
-	approvals map[string]pendingApproval
-	asks      map[string]pendingAsk
-	granted   map[string]bool
-	nextID    int
-	// toolApprovalMode is the runtime approval posture: "ask" prompts, "auto"
-	// lets the policy auto-approve the writer fallback while preserving ask/deny
-	// rules, and "yolo" skips every tool approval prompt except plan approval.
+	approvals map[string]pendingApproval // 待处理的工具审批映射
+	asks      map[string]pendingAsk     // 待处理的提问映射
+	granted   map[string]bool           // 本会话已授权的规则集合
+	nextID    int                       // 下一个审批/提问的自增 ID
+	// toolApprovalMode 是运行时审批姿态：
+	//   - "ask": 每次都提示用户
+	//   - "auto": 策略自动批准写入回退，同时保留 ask/deny 规则
+	//   - "yolo": 跳过所有工具审批提示（计划审批除外）
 	toolApprovalMode string
-	// approvalTimeout bounds how long requestApproval/Ask block on a user
-	// decision. Zero means wait indefinitely (correct for an interactive
-	// terminal); bot/headless frontends set it so a walked-away user can't wedge
-	// the session forever (#4626, #4402). Write-once at construction.
+	// approvalTimeout 限制 requestApproval/Ask 阻塞等待用户决策的时长。
+	// 零值表示无限等待（适用于交互式终端）；
+	// bot/无头前端设置此值以防止离开的用户永久阻塞会话（#4626, #4402）。
+	// 构造时一次性写入。
 	approvalTimeout time.Duration
-	// planAutoApprove auto-allows writer tool calls without prompting while a
-	// just-approved plan executes. Set by the turn loop, read by the bypass
-	// check. Plan approval is the go-ahead, so the model shouldn't re-prompt for
-	// every write of the work it just got cleared to do.
+	// planAutoApprove 在刚批准的计划执行期间自动允许写入工具调用，无需提示。
+	// 由轮次循环设置，由旁路检查读取。计划批准意味着放行，
+	// 因此模型不应为每个写入操作再次提示。
 	planAutoApprove bool
 
-	// promptMu serializes outstanding prompts so at most one user decision is in
-	// flight. Held across the blocking wait, so it must never be taken by the
-	// resolve paths (Approve/AnswerQuestion).
+	// promptMu 序列化待处理的提示，确保同时最多只有一个用户决策在飞行中。
+	// 在阻塞等待期间持有，因此解析路径（Approve/AnswerQuestion）绝不能获取此锁。
 	promptMu sync.Mutex
 }
 
@@ -65,17 +70,15 @@ func newApprovalManager(policy permission.Policy, mode string, timeout time.Dura
 	}
 }
 
-// preApproved reports whether a tool call can skip the prompt — either the
-// posture bypasses it (YOLO / plan-execution window) or a session grant already
-// covers the scope.
+// preApproved 判断工具调用是否可以跳过提示——要么姿态绕过了它（YOLO / 计划执行窗口），
+// 要么会话授权已覆盖该范围。
 func (a *approvalManager) preApproved(tool, subject string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.bypassAllowsLocked(tool) || a.sessionGrantAllowsLocked(tool, subject)
 }
 
-// register allocates an approval ID, records the pending prompt, and returns the
-// reply channel the resolve path will signal.
+// register 分配一个审批 ID，记录待处理的提示，并返回解析路径将发送信号的回复通道。
 func (a *approvalManager) register(tool, subject string) (string, chan approvalReply) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -86,22 +89,21 @@ func (a *approvalManager) register(tool, subject string) (string, chan approvalR
 	return id, reply
 }
 
-// grantSession records a session-scoped grant so future calls in the same scope
-// short-circuit.
+// grantSession 记录一个会话范围的授权，使同范围内的后续调用可以短路跳过。
 func (a *approvalManager) grantSession(tool, subject string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.granted[permission.SessionGrantRuleForScope(tool, subject)] = true
 }
 
-// cancel drops a pending approval (timeout/abort path).
+// cancel 移除一个待处理的审批（超时/中止路径）。
 func (a *approvalManager) cancel(id string) {
 	a.mu.Lock()
 	delete(a.approvals, id)
 	a.mu.Unlock()
 }
 
-// resolve removes and returns the pending approval for id (Approve path).
+// resolve 移除并返回指定 ID 的待处理审批（Approve 路径）。
 func (a *approvalManager) resolve(id string) pendingApproval {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -110,8 +112,7 @@ func (a *approvalManager) resolve(id string) pendingApproval {
 	return p
 }
 
-// registerAsk allocates an ask ID, records the pending question batch, and
-// returns the reply channel.
+// registerAsk 分配一个提问 ID，记录待处理的问题批次，并返回回复通道。
 func (a *approvalManager) registerAsk(questions []event.AskQuestion) (string, chan []event.AskAnswer) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -122,14 +123,14 @@ func (a *approvalManager) registerAsk(questions []event.AskQuestion) (string, ch
 	return id, reply
 }
 
-// cancelAsk drops a pending ask (timeout/abort path).
+// cancelAsk 移除一个待处理的提问（超时/中止路径）。
 func (a *approvalManager) cancelAsk(id string) {
 	a.mu.Lock()
 	delete(a.asks, id)
 	a.mu.Unlock()
 }
 
-// resolveAsk removes and returns the pending ask for id (AnswerQuestion path).
+// resolveAsk 移除并返回指定 ID 的待处理提问（AnswerQuestion 路径）。
 func (a *approvalManager) resolveAsk(id string) (pendingAsk, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -138,8 +139,8 @@ func (a *approvalManager) resolveAsk(id string) (pendingAsk, bool) {
 	return p, ok
 }
 
-// clearAll drops every in-flight prompt without signaling — the cancel path,
-// where blocked waiters unblock via their cancelled context instead.
+// clearAll 移除所有飞行中的提示而不发送信号——取消路径中，
+// 被阻塞的等待者通过已取消的 context 解除阻塞。
 func (a *approvalManager) clearAll() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -147,23 +148,22 @@ func (a *approvalManager) clearAll() {
 	clear(a.asks)
 }
 
-// hasPending reports whether any prompt is awaiting a user decision.
+// hasPending 报告是否有提示正在等待用户决策。
 func (a *approvalManager) hasPending() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.approvals) > 0 || len(a.asks) > 0
 }
 
-// mode returns the normalized runtime approval posture.
+// mode 返回规范化的运行时审批姿态。
 func (a *approvalManager) mode() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return normalizeToolApprovalMode(a.toolApprovalMode)
 }
 
-// setMode applies a (pre-normalized) posture and drains any pending approvals
-// the new posture should auto-allow, returning their reply channels for the
-// caller to signal after unlocking.
+// setMode 应用（预规范化的）姿态，并排空新姿态应自动允许的待处理审批，
+// 返回它们的回复通道以便调用者在解锁后发送信号。
 func (a *approvalManager) setMode(mode string) []chan approvalReply {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -177,14 +177,14 @@ func (a *approvalManager) setMode(mode string) []chan approvalReply {
 	return nil
 }
 
-// setPlanAutoApprove toggles the just-approved-plan execution window.
+// setPlanAutoApprove 切换刚批准的计划执行窗口。
 func (a *approvalManager) setPlanAutoApprove(on bool) {
 	a.mu.Lock()
 	a.planAutoApprove = on
 	a.mu.Unlock()
 }
 
-// waitContext bounds the blocking wait by approvalTimeout when set.
+// waitContext 在设置了 approvalTimeout 时为阻塞等待添加超时边界。
 func (a *approvalManager) waitContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if a.approvalTimeout <= 0 {
 		return ctx, func() {}
@@ -192,8 +192,7 @@ func (a *approvalManager) waitContext(ctx context.Context) (context.Context, con
 	return context.WithTimeout(ctx, a.approvalTimeout)
 }
 
-// snapshotPrompts copies the in-flight prompts for re-emission to a reconnected
-// frontend (ReplayPendingPrompts).
+// snapshotPrompts 复制飞行中的提示，用于向重新连接的前端重新发出（ReplayPendingPrompts）。
 func (a *approvalManager) snapshotPrompts() ([]event.Approval, []event.Ask) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -208,7 +207,7 @@ func (a *approvalManager) snapshotPrompts() ([]event.Approval, []event.Ask) {
 	return approvals, asks
 }
 
-// --- decision helpers (caller holds a.mu) ---
+// --- 决策辅助函数（调用者持有 a.mu） ---
 
 func (a *approvalManager) bypassAllowsLocked(tool string) bool {
 	if requiresFreshApprovalTool(tool) {
@@ -238,9 +237,8 @@ func (a *approvalManager) sessionGrantAllowsLocked(tool, subject string) bool {
 	return false
 }
 
-// drainLocked removes every pending approval the new posture should auto-allow
-// and returns their reply channels; caller holds a.mu and sends {allow:true}
-// after unlocking.
+// drainLocked 移除新姿态应自动允许的所有待处理审批，并返回它们的回复通道；
+// 调用者持有 a.mu，在解锁后发送 {allow:true}。
 func (a *approvalManager) drainLocked(includeExplicitAsk bool) []chan approvalReply {
 	pending := make([]chan approvalReply, 0, len(a.approvals))
 	for id, approval := range a.approvals {
@@ -256,7 +254,7 @@ func (a *approvalManager) drainLocked(includeExplicitAsk bool) []chan approvalRe
 	return pending
 }
 
-// --- pure approval helpers ---
+// --- 纯审批辅助函数 ---
 
 func normalizeToolApprovalMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
